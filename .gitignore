@@ -36,3 +36,7 @@ settings.local.json
 ./docs/updater-release.md
 
 designs/
+
+# Local agent tool state (never commit)
+.claude/
+.omc/

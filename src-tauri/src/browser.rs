@@ -1,11 +1,11 @@
-#[cfg(test)]
-use std::net::TcpListener;
 use std::{
     fs,
     future::Future,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::PathBuf,
     pin::Pin,
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Mutex, RwLock,
@@ -145,7 +145,6 @@ static ACTIVE_DEBUG_PORT: Lazy<RwLock<Option<u16>>> = Lazy::new(|| RwLock::new(N
 static MANAGED_BROWSER_START_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static ACTIVE_TASK_BROWSER_LEASES: AtomicUsize = AtomicUsize::new(0);
 
-const DEFAULT_RPA_DEBUG_PORT: u16 = 9876;
 const BROWSER_START_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,8 +156,14 @@ struct ManagedBrowserRecord {
 
 enum BrowserSession {
     Empty,
-    Ready(ChromiumPage),
-    InUse { close_requested: bool },
+    Ready {
+        browser: ChromiumPage,
+        identity: BrowserSessionIdentity,
+    },
+    InUse {
+        close_requested: bool,
+        identity: Option<BrowserSessionIdentity>,
+    },
 }
 
 /// Tabs created through a task lease. Keeping ownership explicit is important:
@@ -276,14 +281,35 @@ pub fn init_browser_session(config: &BrowserConfig) -> Result<()> {
         .map_err(|e| anyhow!("获取浏览器会话写锁失败: {}", e))?;
 
     match &*session {
-        BrowserSession::Ready(browser) => {
+        BrowserSession::Ready { browser, identity } => {
             if is_browser_session_usable(browser) {
-                return Ok(());
+                match ready_session_config_action(
+                    identity,
+                    config,
+                    ACTIVE_TASK_BROWSER_LEASES.load(Ordering::Acquire),
+                ) {
+                    ReadySessionConfigAction::Reuse => return Ok(()),
+                    ReadySessionConfigAction::RejectActiveLeases => {
+                        return Err(anyhow!(
+                            "浏览器配置已变化，但仍有自动化任务正在使用当前浏览器"
+                        ));
+                    }
+                    ReadySessionConfigAction::Restart => {}
+                }
             } else {
                 *session = BrowserSession::Empty;
             }
         }
-        BrowserSession::InUse { .. } => {
+        BrowserSession::InUse { identity, .. } => {
+            if identity.as_ref().is_some_and(|identity| {
+                ready_session_config_action(
+                    identity,
+                    config,
+                    ACTIVE_TASK_BROWSER_LEASES.load(Ordering::Acquire),
+                ) != ReadySessionConfigAction::Reuse
+            }) {
+                return Err(anyhow!("浏览器正在使用中，无法切换 profile 或调试端口"));
+            }
             // A legacy `with_browser` caller currently owns the anchor
             // connection. Task-scoped callers can still attach through CDP;
             // never reset the anchor here because that would race its later
@@ -305,19 +331,19 @@ pub fn init_browser_session(config: &BrowserConfig) -> Result<()> {
         &mut *session,
         BrowserSession::InUse {
             close_requested: false,
+            identity: None,
         },
     );
     let previous_session = match previous_session {
-        BrowserSession::Ready(mut browser) => {
-            if !is_browser_session_usable(&browser) {
-                browser.close_browser();
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
+        BrowserSession::Ready { mut browser, .. } => {
+            browser.close_browser();
+            std::thread::sleep(std::time::Duration::from_millis(300));
             BrowserSession::Empty
         }
         previous => previous,
     };
 
+    let executable = browser_executable(config)?.to_string_lossy().into_owned();
     let browser = match create_browser(config) {
         Ok(browser) => browser,
         Err(err) => {
@@ -325,20 +351,106 @@ pub fn init_browser_session(config: &BrowserConfig) -> Result<()> {
             return Err(err);
         }
     };
+    let debug_port = ACTIVE_DEBUG_PORT
+        .read()
+        .map_err(|e| anyhow!("获取浏览器调试端口读锁失败: {}", e))?
+        .ok_or_else(|| anyhow!("浏览器已初始化但调试端口未知"))?;
 
-    *session = BrowserSession::Ready(browser);
+    *session = BrowserSession::Ready {
+        browser,
+        identity: BrowserSessionIdentity {
+            user_data_dir: config.user_data_dir.clone(),
+            debug_port,
+            executable,
+        },
+    };
 
     Ok(())
 }
 
 fn is_cdp_port_active(port: u16) -> bool {
-    std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        std::time::Duration::from_millis(300),
-    )
-    .is_ok()
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+    if stream
+        .write_all(b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut response = String::new();
+    if stream.read_to_string(&mut response).is_err() {
+        return false;
+    }
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    if !headers.starts_with("HTTP/1.1 200") && !headers.starts_with("HTTP/1.0 200") {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .get("Browser")
+                .and_then(|value| value.as_str())
+                .is_some()
+                && value
+                    .get("webSocketDebuggerUrl")
+                    .and_then(|value| value.as_str())
+                    .is_some()
+        })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserSessionIdentity {
+    user_data_dir: String,
+    debug_port: u16,
+    executable: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadySessionConfigAction {
+    Reuse,
+    Restart,
+    RejectActiveLeases,
+}
+
+fn ready_session_config_action_with_executable(
+    current: &BrowserSessionIdentity,
+    config: &BrowserConfig,
+    executable: &str,
+    active_leases: usize,
+) -> ReadySessionConfigAction {
+    let profile_matches = profiles_match(&current.user_data_dir, &config.user_data_dir);
+    let port_matches = configured_port_allows_reuse(config, current.debug_port);
+    let executable_matches = executable_paths_match(&current.executable, executable);
+    if profile_matches && port_matches && executable_matches {
+        ReadySessionConfigAction::Reuse
+    } else if active_leases > 0 {
+        ReadySessionConfigAction::RejectActiveLeases
+    } else {
+        ReadySessionConfigAction::Restart
+    }
+}
+
+fn ready_session_config_action(
+    current: &BrowserSessionIdentity,
+    config: &BrowserConfig,
+    active_leases: usize,
+) -> ReadySessionConfigAction {
+    let executable = browser_executable(config)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    ready_session_config_action_with_executable(current, config, &executable, active_leases)
+}
+
+#[cfg(test)]
 fn should_connect_to_existing_browser(cdp_port_active: bool) -> bool {
     cdp_port_active
 }
@@ -347,6 +459,7 @@ fn cdp_connection_requires_stealth_injection() -> bool {
     true
 }
 
+#[cfg(test)]
 fn managed_browser_can_be_reused(
     record: &ManagedBrowserRecord,
     config: &BrowserConfig,
@@ -355,15 +468,645 @@ fn managed_browser_can_be_reused(
     cdp_port_active && record.user_data_dir == config.user_data_dir
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortOwnership {
+    Owned,
+    NotOwned,
+    Unknown,
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessCommandState {
+    Alive {
+        browser_process: bool,
+        user_data_dir: Option<String>,
+    },
+    Dead,
+    Unknown,
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn command_user_data_dir_from_argv(args: &[&[u8]]) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        let arg = String::from_utf8_lossy(arg);
+        if let Some(value) = arg.strip_prefix("--user-data-dir=") {
+            return (!value.is_empty()).then(|| value.to_string());
+        }
+        if arg == "--user-data-dir" {
+            return args
+                .get(index + 1)
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+                .filter(|value| !value.is_empty());
+        }
+    }
+    None
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_cmdline_state(bytes: Option<&[u8]>) -> ProcessCommandState {
+    let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) else {
+        return ProcessCommandState::Unknown;
+    };
+    let args: Vec<&[u8]> = bytes
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(executable) = args.first() else {
+        return ProcessCommandState::Unknown;
+    };
+    ProcessCommandState::Alive {
+        browser_process: command_identifies_browser(&String::from_utf8_lossy(executable)),
+        user_data_dir: command_user_data_dir_from_argv(&args),
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_cmdline_state_from_result(result: std::io::Result<Vec<u8>>) -> ProcessCommandState {
+    match result {
+        Ok(bytes) => linux_cmdline_state(Some(&bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProcessCommandState::Dead,
+        Err(_) => ProcessCommandState::Unknown,
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn linux_port_ownership_from_evidence(
+    fd_complete: bool,
+    socket_inodes: &[String],
+    tables: &[std::result::Result<String, ()>],
+    port: u16,
+) -> PortOwnership {
+    if !fd_complete
+        || socket_inodes.is_empty()
+        || tables.len() != 2
+        || tables.iter().any(Result::is_err)
+    {
+        return PortOwnership::Unknown;
+    }
+    let port_hex = format!("{port:04X}");
+    for content in tables.iter().filter_map(|table| table.as_ref().ok()) {
+        if !content.is_empty()
+            && !content
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("local_address"))
+        {
+            return PortOwnership::Unknown;
+        }
+        for line in content.lines().skip(1) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() <= 9 || fields[1].rsplit_once(':').is_none() {
+                return PortOwnership::Unknown;
+            }
+            let local_port = fields[1].rsplit_once(':').map(|(_, port)| port);
+            if fields[3] == "0A"
+                && local_port == Some(port_hex.as_str())
+                && socket_inodes.iter().any(|inode| inode == fields[9])
+            {
+                return PortOwnership::Owned;
+            }
+        }
+    }
+    PortOwnership::NotOwned
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_port_ownership(command_succeeded: bool, stdout: &str) -> PortOwnership {
+    if !command_succeeded || !stdout.lines().any(|line| line == "PORT_QUERY_OK=1") {
+        return PortOwnership::Unknown;
+    }
+    if stdout.lines().any(|line| line == "OWNS=1") {
+        PortOwnership::Owned
+    } else if stdout.lines().any(|line| line == "OWNS=0") {
+        PortOwnership::NotOwned
+    } else {
+        PortOwnership::Unknown
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_command_user_data_dir(command: &str) -> Option<String> {
+    let marker = "--user-data-dir";
+    let start = command.find(marker)?;
+    let remainder = command.get(start + marker.len()..)?;
+    if !remainder.starts_with('=') && !remainder.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let value = command_user_data_dir(command)?;
+    let quoted = remainder.trim_start().starts_with("=\"")
+        || remainder.trim_start().starts_with("='")
+        || remainder.trim_start().starts_with('"')
+        || remainder.trim_start().starts_with('\'');
+    if !quoted && remainder.contains(' ') && command.contains(&format!("{value} ")) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildPollAction {
+    Exited,
+    Continue,
+    CleanupAndFail,
+}
+
+fn child_poll_action(
+    result: &std::io::Result<Option<std::process::ExitStatus>>,
+) -> ChildPollAction {
+    match result {
+        Ok(Some(_)) => ChildPollAction::Exited,
+        Ok(None) => ChildPollAction::Continue,
+        Err(_) => ChildPollAction::CleanupAndFail,
+    }
+}
+
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>> {
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let poll_result = child.try_wait();
+        match child_poll_action(&poll_result) {
+            ChildPollAction::Exited => return child.wait_with_output().map(Some),
+            ChildPollAction::Continue => {}
+            ChildPollAction::CleanupAndFail => {
+                cleanup_spawned_child(&mut child);
+                return Err(poll_result.expect_err("poll action must preserve the error"));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            cleanup_spawned_child(&mut child);
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn parse_macos_procargs(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if bytes.len() < std::mem::size_of::<i32>() {
+        return None;
+    }
+    let argc = i32::from_ne_bytes(bytes[..4].try_into().ok()?);
+    if argc <= 0 {
+        return None;
+    }
+    let mut cursor = 4;
+    while cursor < bytes.len() && bytes[cursor] != 0 {
+        cursor += 1;
+    }
+    while cursor < bytes.len() && bytes[cursor] == 0 {
+        cursor += 1;
+    }
+    let mut args = Vec::with_capacity(argc as usize);
+    while cursor < bytes.len() && args.len() < argc as usize {
+        let end = bytes[cursor..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| cursor + offset)?;
+        if end > cursor {
+            args.push(bytes[cursor..end].to_vec());
+        }
+        cursor = end + 1;
+    }
+    (args.len() == argc as usize).then_some(args)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_procargs_state_from_result(result: std::io::Result<Vec<Vec<u8>>>) -> ProcessCommandState {
+    match result {
+        Ok(args) if !args.is_empty() => {
+            let executable = String::from_utf8_lossy(&args[0]);
+            let arg_refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+            ProcessCommandState::Alive {
+                browser_process: command_identifies_browser(&executable),
+                user_data_dir: command_user_data_dir_from_argv(&arg_refs),
+            }
+        }
+        Ok(_) => ProcessCommandState::Unknown,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => ProcessCommandState::Dead,
+        Err(_) => ProcessCommandState::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_argv(pid: u32) -> std::io::Result<Vec<Vec<u8>>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size = 0usize;
+    // SAFETY: the first sysctl call only obtains the required output size.
+    let first_result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if first_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut bytes = vec![0u8; size];
+    // SAFETY: bytes has the capacity returned by the first sysctl call.
+    let second_result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if second_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    bytes.truncate(size);
+    parse_macos_procargs(&bytes).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid KERN_PROCARGS2")
+    })
+}
+
+fn cleanup_spawned_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_browser_launch_attempts<T, F>(automatic: bool, mut launch: F) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    let attempts = if automatic { BROWSER_START_ATTEMPTS } else { 1 };
+    let mut last_error = None;
+    for _ in 0..attempts {
+        match launch() {
+            Ok(value) => return Ok(value),
+            Err(error) if automatic => last_error = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("Chrome 启动重试次数已耗尽")))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn lsof_port_ownership(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> PortOwnership {
+    match exit_code {
+        Some(0) if !stdout.is_empty() => PortOwnership::Owned,
+        Some(1) if stdout.is_empty() && stderr.is_empty() => PortOwnership::NotOwned,
+        _ => PortOwnership::Unknown,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedProcessEvidence {
+    pid_alive: bool,
+    browser_process: bool,
+    process_user_data_dir: Option<String>,
+    port_ownership: PortOwnership,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedRecordAction {
+    NoRecord,
+    Reuse(u16),
+    RejectPortChange,
+    RejectUnverified,
+    RemoveStale,
+    Ignore,
+}
+
+fn command_identifies_browser(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    command.contains("google chrome")
+        || command.contains("chrome.exe")
+        || command.contains("chromium")
+        || command.contains("microsoft edge")
+        || command.contains("msedge.exe")
+}
+
+fn command_user_data_dir(command: &str) -> Option<String> {
+    let marker = "--user-data-dir";
+    let marker_start = command.find(marker)?;
+    let argument_quoted = marker_start > 0
+        && command
+            .as_bytes()
+            .get(marker_start - 1)
+            .is_some_and(|byte| *byte == b'"');
+    let start = marker_start + marker.len();
+    let remainder = command[start..].trim_start();
+    let remainder = remainder
+        .strip_prefix('=')
+        .unwrap_or(remainder)
+        .trim_start();
+    if remainder.is_empty() {
+        return None;
+    }
+    let value = if argument_quoted {
+        let end = remainder.find('"')?;
+        &remainder[..end]
+    } else if let Some(quoted) = remainder.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        &quoted[..end]
+    } else if let Some(quoted) = remainder.strip_prefix('\'') {
+        let end = quoted.find('\'')?;
+        &quoted[..end]
+    } else {
+        let end = remainder
+            .find(char::is_whitespace)
+            .unwrap_or(remainder.len());
+        &remainder[..end]
+    };
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn normalize_profile_path(path: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(path);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        use std::path::Component;
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
+fn executable_paths_match(left: &str, right: &str) -> bool {
+    profiles_match(left, right)
+}
+
+fn profiles_match(left: &str, right: &str) -> bool {
+    normalize_profile_path(left)
+        .zip(normalize_profile_path(right))
+        .is_some_and(|(left, right)| {
+            if cfg!(target_os = "windows") {
+                left.to_string_lossy()
+                    .eq_ignore_ascii_case(&right.to_string_lossy())
+            } else {
+                left == right
+            }
+        })
+}
+
+fn managed_record_action(
+    record: Option<&ManagedBrowserRecord>,
+    config: &BrowserConfig,
+    evidence: &ManagedProcessEvidence,
+    cdp_port_active: bool,
+) -> ManagedRecordAction {
+    let Some(record) = record else {
+        return ManagedRecordAction::NoRecord;
+    };
+    if !evidence.pid_alive {
+        return ManagedRecordAction::RemoveStale;
+    }
+    let Some(process_profile) = evidence.process_user_data_dir.as_deref() else {
+        return ManagedRecordAction::RejectUnverified;
+    };
+    if !evidence.browser_process || !profiles_match(&record.user_data_dir, process_profile) {
+        return ManagedRecordAction::RemoveStale;
+    }
+    if !profiles_match(&config.user_data_dir, process_profile) {
+        return ManagedRecordAction::RejectUnverified;
+    }
+    if !cdp_port_active
+        || evidence.port_ownership == PortOwnership::NotOwned
+        || evidence.port_ownership == PortOwnership::Unknown
+    {
+        return ManagedRecordAction::RejectUnverified;
+    }
+    if !profiles_match(&record.user_data_dir, &config.user_data_dir) {
+        return ManagedRecordAction::Ignore;
+    }
+    if !configured_port_allows_reuse(config, record.port) {
+        return ManagedRecordAction::RejectPortChange;
+    }
+    ManagedRecordAction::Reuse(record.port)
+}
+
+fn inspect_managed_process(record: &ManagedBrowserRecord) -> ManagedProcessEvidence {
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             $p=Get-CimInstance Win32_Process -Filter \"ProcessId={}\"; \
+             $connections=@(Get-NetTCPConnection -State Listen -LocalPort {}); \
+             Write-Output 'PORT_QUERY_OK=1'; \
+             if($p){{Write-Output ('CMD=' + $p.CommandLine)}}; \
+             if($connections | Where-Object {{$_.OwningProcess -eq {}}}){{Write-Output 'OWNS=1'}}else{{Write-Output 'OWNS=0'}}",
+            record.pid, record.port, record.pid
+        );
+        let output = command_output_with_timeout(
+            Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]),
+            Duration::from_secs(3),
+        );
+        return match output {
+            Ok(Some(output)) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let command = stdout
+                    .lines()
+                    .find_map(|line| line.strip_prefix("CMD="))
+                    .unwrap_or_default();
+                ManagedProcessEvidence {
+                    pid_alive: !command.is_empty(),
+                    browser_process: command_identifies_browser(command),
+                    process_user_data_dir: command_user_data_dir(command),
+                    port_ownership: windows_port_ownership(true, &stdout),
+                }
+            }
+            _ => ManagedProcessEvidence {
+                pid_alive: true,
+                browser_process: true,
+                process_user_data_dir: None,
+                port_ownership: PortOwnership::Unknown,
+            },
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let command_state =
+            linux_cmdline_state_from_result(fs::read(format!("/proc/{}/cmdline", record.pid)));
+        let (pid_alive, browser_process, process_user_data_dir) = match command_state {
+            ProcessCommandState::Alive {
+                browser_process,
+                user_data_dir,
+            } => (true, browser_process, user_data_dir),
+            ProcessCommandState::Dead => (false, false, None),
+            ProcessCommandState::Unknown => (true, true, None),
+        };
+        return ManagedProcessEvidence {
+            pid_alive,
+            browser_process,
+            process_user_data_dir,
+            port_ownership: linux_process_port_ownership(record.pid, record.port),
+        };
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let pid = record.pid.to_string();
+        let command_state = macos_procargs_state_from_result(macos_process_argv(record.pid));
+        let (pid_alive, browser_process, process_user_data_dir) = match command_state {
+            ProcessCommandState::Alive {
+                browser_process,
+                user_data_dir,
+            } => (true, browser_process, user_data_dir),
+            ProcessCommandState::Dead => (false, false, None),
+            ProcessCommandState::Unknown => (true, true, None),
+        };
+        if !pid_alive || process_user_data_dir.is_none() {
+            return ManagedProcessEvidence {
+                pid_alive,
+                browser_process,
+                process_user_data_dir,
+                port_ownership: PortOwnership::Unknown,
+            };
+        }
+        let port = format!("TCP:{}", record.port);
+        let port_ownership = match command_output_with_timeout(
+            Command::new("lsof").args(["-nP", "-a", "-p", &pid, "-i", &port, "-sTCP:LISTEN"]),
+            Duration::from_secs(3),
+        ) {
+            Ok(Some(output)) => {
+                lsof_port_ownership(output.status.code(), &output.stdout, &output.stderr)
+            }
+            _ => PortOwnership::Unknown,
+        };
+        return ManagedProcessEvidence {
+            pid_alive,
+            browser_process,
+            process_user_data_dir,
+            port_ownership,
+        };
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    ManagedProcessEvidence {
+        pid_alive: false,
+        browser_process: false,
+        process_user_data_dir: None,
+        port_ownership: PortOwnership::Unknown,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_port_ownership(pid: u32, port: u16) -> PortOwnership {
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return PortOwnership::Unknown;
+    };
+    let mut fd_complete = true;
+    let mut socket_inodes = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            fd_complete = false;
+            continue;
+        };
+        let Ok(target) = fs::read_link(entry.path()) else {
+            fd_complete = false;
+            continue;
+        };
+        let target = target.to_string_lossy();
+        if let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|inode| inode.strip_suffix(']'))
+        {
+            socket_inodes.push(inode.to_string());
+        }
+    }
+    let tables = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .map(|table| fs::read_to_string(table).map_err(|_| ()))
+        .to_vec();
+    linux_port_ownership_from_evidence(fd_complete, &socket_inodes, &tables, port)
+}
+
+fn remove_managed_browser_record() {
+    if let Ok(path) = managed_browser_record_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn configured_port_allows_reuse(config: &BrowserConfig, port: u16) -> bool {
+    config
+        .debug_port
+        .is_none_or(|configured_port| configured_port == 0 || configured_port == port)
+}
+
+fn reusable_managed_browser_port(
+    record: Option<&ManagedBrowserRecord>,
+    config: &BrowserConfig,
+) -> Result<Option<u16>> {
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let evidence = inspect_managed_process(record);
+    match managed_record_action(
+        Some(record),
+        config,
+        &evidence,
+        is_cdp_port_active(record.port),
+    ) {
+        ManagedRecordAction::Reuse(port) => Ok(Some(port)),
+        ManagedRecordAction::RejectPortChange => Err(anyhow!(
+            "同一 profile 的受管浏览器仍在端口 {} 运行；请先关闭浏览器后再切换到显式端口",
+            record.port
+        )),
+        ManagedRecordAction::RejectUnverified => Err(anyhow!(
+            "无法验证受管浏览器 PID {} 的 profile 或调试端口归属，已拒绝复用或启动第二实例",
+            record.pid
+        )),
+        ManagedRecordAction::RemoveStale => {
+            remove_managed_browser_record();
+            Ok(None)
+        }
+        ManagedRecordAction::NoRecord | ManagedRecordAction::Ignore => Ok(None),
+    }
+}
+
 fn managed_browser_record_path() -> Result<PathBuf> {
     let app_handle = app_handle().ok_or_else(|| anyhow!("应用句柄尚未初始化"))?;
     Ok(app_handle.path().app_data_dir()?.join("rpa-browser.json"))
 }
 
-fn load_managed_browser_record() -> Option<ManagedBrowserRecord> {
-    let path = managed_browser_record_path().ok()?;
-    let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+#[derive(Debug, Clone)]
+enum ManagedRecordLoad {
+    Missing,
+    Ready(ManagedBrowserRecord),
+    Unverified,
+}
+
+fn managed_record_load_from_result(result: std::io::Result<String>) -> ManagedRecordLoad {
+    match result {
+        Ok(content) => serde_json::from_str(&content)
+            .map(ManagedRecordLoad::Ready)
+            .unwrap_or(ManagedRecordLoad::Unverified),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ManagedRecordLoad::Missing,
+        Err(_) => ManagedRecordLoad::Unverified,
+    }
+}
+
+fn load_managed_browser_record() -> ManagedRecordLoad {
+    let Ok(path) = managed_browser_record_path() else {
+        return ManagedRecordLoad::Unverified;
+    };
+    managed_record_load_from_result(fs::read_to_string(path))
 }
 
 fn save_managed_browser_record(record: &ManagedBrowserRecord) -> Result<()> {
@@ -413,6 +1156,41 @@ fn connect_task_browser(port: u16) -> Result<ChromiumPage> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserLaunchAttempt {
+    Ready(u16),
+    PortClaimed,
+    ReadinessTimeout,
+}
+
+fn classify_launch_probe_with<F>(cdp_active: bool, port_owned_by_child: F) -> BrowserLaunchAttempt
+where
+    F: FnOnce() -> bool,
+{
+    if !cdp_active {
+        return BrowserLaunchAttempt::ReadinessTimeout;
+    }
+    if port_owned_by_child() {
+        BrowserLaunchAttempt::Ready(0)
+    } else {
+        BrowserLaunchAttempt::PortClaimed
+    }
+}
+
+fn classify_launch_probe(cdp_active: bool, port_owned_by_child: bool) -> BrowserLaunchAttempt {
+    classify_launch_probe_with(cdp_active, || port_owned_by_child)
+}
+
+fn process_owns_port(pid: u32, port: u16) -> bool {
+    inspect_managed_process(&ManagedBrowserRecord {
+        pid,
+        port,
+        user_data_dir: String::new(),
+    })
+    .port_ownership
+        == PortOwnership::Owned
+}
+
 fn launch_managed_browser(config: &BrowserConfig, port: u16) -> Result<ChromiumPage> {
     fs::create_dir_all(&config.user_data_dir)?;
     let executable = browser_executable(config)?;
@@ -437,85 +1215,113 @@ fn launch_managed_browser(config: &BrowserConfig, port: u16) -> Result<ChromiumP
         .spawn()?;
 
     for _ in 0..BROWSER_START_ATTEMPTS * 20 {
-        if should_connect_to_existing_browser(is_cdp_port_active(port)) {
-            if let Ok(browser) = connect_to_browser(port) {
-                save_managed_browser_record(&ManagedBrowserRecord {
-                    pid: child.id(),
-                    port,
-                    user_data_dir: config.user_data_dir.clone(),
-                })?;
-                return Ok(browser);
+        let cdp_active = is_cdp_port_active(port);
+        match classify_launch_probe_with(cdp_active, || process_owns_port(child.id(), port)) {
+            BrowserLaunchAttempt::Ready(_) => {
+                if let Ok(browser) = connect_to_browser(port) {
+                    let record = ManagedBrowserRecord {
+                        pid: child.id(),
+                        port,
+                        user_data_dir: config.user_data_dir.clone(),
+                    };
+                    if let Err(error) = save_managed_browser_record(&record) {
+                        cleanup_spawned_child(&mut child);
+                        return Err(error.context("保存受管浏览器进程记录失败"));
+                    }
+                    return Ok(browser);
+                }
             }
+            BrowserLaunchAttempt::PortClaimed => {
+                cleanup_spawned_child(&mut child);
+                return Err(anyhow!(
+                    "Chrome 启动期间调试端口 {port} 被其他进程抢占，已拒绝连接"
+                ));
+            }
+            BrowserLaunchAttempt::ReadinessTimeout => {}
         }
-        if child.try_wait()?.is_some() {
-            break;
+        let poll_result = child.try_wait();
+        match child_poll_action(&poll_result) {
+            ChildPollAction::Exited => break,
+            ChildPollAction::Continue => {}
+            ChildPollAction::CleanupAndFail => {
+                cleanup_spawned_child(&mut child);
+                return Err(poll_result
+                    .expect_err("poll action must preserve the error")
+                    .into());
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = child.kill();
+    cleanup_spawned_child(&mut child);
     Err(anyhow!("Chrome 启动后未能建立 CDP 连接"))
 }
 
 fn create_browser(config: &BrowserConfig) -> Result<ChromiumPage> {
-    // 候选端口列表：优先检查已记录的活跃端口、默认固定端口(9876)及附近备用端口
-    let mut candidate_ports = Vec::new();
-    if let Ok(guard) = ACTIVE_DEBUG_PORT.read() {
-        if let Some(port) = *guard {
-            candidate_ports.push(port);
+    let managed_record = match load_managed_browser_record() {
+        ManagedRecordLoad::Missing => None,
+        ManagedRecordLoad::Ready(record) => Some(record),
+        ManagedRecordLoad::Unverified => {
+            return Err(anyhow!(
+                "受管浏览器进程记录无法读取或解析，已拒绝启动第二实例；请确认旧浏览器已关闭后删除 rpa-browser.json"
+            ));
         }
-    }
-    if !candidate_ports.contains(&DEFAULT_RPA_DEBUG_PORT) {
-        candidate_ports.push(DEFAULT_RPA_DEBUG_PORT);
-    }
+    };
+    let active_port = ACTIVE_DEBUG_PORT.read().ok().and_then(|guard| *guard);
+    let reusable_port = if let Some(port) = active_port.filter(|port| {
+        configured_port_allows_reuse(config, *port)
+            && managed_record.as_ref().is_some_and(|record| {
+                record.port == *port
+                    && managed_record_action(
+                        Some(record),
+                        config,
+                        &inspect_managed_process(record),
+                        is_cdp_port_active(*port),
+                    ) == ManagedRecordAction::Reuse(*port)
+            })
+    }) {
+        Some(port)
+    } else {
+        reusable_managed_browser_port(managed_record.as_ref(), config)?
+    };
 
-    let managed_record = load_managed_browser_record();
-
-    // 1. 端口已被占用时必须只连接已有 Chrome，不能用 ChromiumPage::new()
-    // 再次 launch 会删除同一 user-data-dir 的 Singleton 锁并启动第二个 Chrome，
-    // 导致 macOS 上出现“打开您的个人资料时出了点问题”。即使窗口被用户关闭，
-    // 只要 CDP 进程仍在，ChromiumPage::connect 会复用它并按需新建标签页。
-    for &port in &candidate_ports {
-        if should_connect_to_existing_browser(is_cdp_port_active(port)) {
-            let record_matches = managed_record
-                .as_ref()
-                .map(|record| managed_browser_can_be_reused(record, config, true))
-                .unwrap_or(port == DEFAULT_RPA_DEBUG_PORT);
-            if !record_matches {
-                return Err(anyhow!(
-                    "检测到非当前 profile 的浏览器调试端口 {port}，已拒绝启动或接管浏览器"
-                ));
-            }
-            match connect_to_browser(port) {
-                Ok(browser) => {
-                    if let Ok(mut guard) = ACTIVE_DEBUG_PORT.write() {
-                        *guard = Some(port);
-                    }
-                    if managed_record.is_none() {
-                        let _ = save_managed_browser_record(&ManagedBrowserRecord {
-                            pid: 0,
-                            port,
-                            user_data_dir: config.user_data_dir.clone(),
-                        });
-                    }
-                    return Ok(browser);
-                }
-                Err(error) => return Err(anyhow!("检测到浏览器调试端口 {port}，但无法连接：{error}。已拒绝启动第二个浏览器以保护个人资料")),
-            }
+    if let Some(port) = reusable_port {
+        let browser = connect_to_browser(port)?;
+        if let Ok(mut guard) = ACTIVE_DEBUG_PORT.write() {
+            *guard = Some(port);
         }
+        return Ok(browser);
     }
 
-    // 2. 没有活动 CDP 实例时，由应用直接启动并记录 PID。不能交给
-    // rust_drission::ChromiumPage::new()，它会删除 profile 锁文件。
-    let target_port = DEFAULT_RPA_DEBUG_PORT;
-    let browser = launch_managed_browser(config, target_port)?;
+    // Do not attach to arbitrary listeners or unrelated CDP instances. Only a
+    // profile-matching managed record is eligible for reuse.
+    let automatic_port = config.debug_port.is_none_or(|port| port == 0);
+    let browser = run_browser_launch_attempts(automatic_port, || {
+        let target_port = select_browser_debug_port(config)?;
+        if TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], target_port)),
+            Duration::from_millis(300),
+        )
+        .is_ok()
+        {
+            return Err(anyhow!("浏览器调试端口 {target_port} 已被占用"));
+        }
+
+        launch_managed_browser(config, target_port).map(|browser| (browser, target_port))
+    })?;
     if let Ok(mut guard) = ACTIVE_DEBUG_PORT.write() {
-        *guard = Some(target_port);
+        *guard = Some(browser.1);
     }
-    Ok(browser)
+    Ok(browser.0)
 }
 
-#[cfg(test)]
+fn select_browser_debug_port(config: &BrowserConfig) -> Result<u16> {
+    match config.debug_port {
+        Some(port @ 1..=u16::MAX) => Ok(port),
+        None | Some(0) => allocate_browser_debug_port(),
+    }
+}
+
 fn allocate_browser_debug_port() -> Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .map_err(|error| anyhow!("无法分配浏览器调试端口：{error}"))?;
@@ -650,15 +1456,28 @@ fn take_browser_session() -> Result<ChromiumPage> {
         &mut *session,
         BrowserSession::InUse {
             close_requested: false,
+            identity: None,
         },
     ) {
-        BrowserSession::Ready(browser) => Ok(browser),
+        BrowserSession::Ready { browser, identity } => {
+            *session = BrowserSession::InUse {
+                close_requested: false,
+                identity: Some(identity),
+            };
+            Ok(browser)
+        }
         BrowserSession::Empty => {
             *session = BrowserSession::Empty;
             Err(anyhow!("浏览器尚未初始化"))
         }
-        BrowserSession::InUse { close_requested } => {
-            *session = BrowserSession::InUse { close_requested };
+        BrowserSession::InUse {
+            close_requested,
+            identity,
+        } => {
+            *session = BrowserSession::InUse {
+                close_requested,
+                identity,
+            };
             Err(anyhow!("浏览器正在使用中"))
         }
     }
@@ -669,12 +1488,13 @@ fn restore_browser_session(mut browser: ChromiumPage, error: Option<&anyhow::Err
         .write()
         .map_err(|e| anyhow!("获取浏览器会话写锁失败: {}", e))?;
 
-    let close_requested = matches!(
-        &*session,
+    let (close_requested, identity) = match &*session {
         BrowserSession::InUse {
-            close_requested: true
-        }
-    );
+            close_requested,
+            identity,
+        } => (*close_requested, identity.clone()),
+        _ => (false, None),
+    };
     let task_leases_active = ACTIVE_TASK_BROWSER_LEASES.load(Ordering::Acquire) > 0;
     *session = if !task_leases_active && close_requested {
         browser.close_browser();
@@ -684,8 +1504,10 @@ fn restore_browser_session(mut browser: ChromiumPage, error: Option<&anyhow::Err
         // Chrome process: another task may be between connection setup and
         // lease publication. The next initialization can reconnect by port.
         BrowserSession::Empty
+    } else if let Some(identity) = identity {
+        BrowserSession::Ready { browser, identity }
     } else {
-        BrowserSession::Ready(browser)
+        BrowserSession::Empty
     };
 
     Ok(())
@@ -703,12 +1525,13 @@ pub fn close_browser_session() -> Result<()> {
         .map_err(|e| anyhow!("获取浏览器会话写锁失败: {}", e))?;
 
     match std::mem::replace(&mut *session, BrowserSession::Empty) {
-        BrowserSession::Ready(mut browser) => {
+        BrowserSession::Ready { mut browser, .. } => {
             browser.close_browser();
         }
-        BrowserSession::InUse { .. } => {
+        BrowserSession::InUse { identity, .. } => {
             *session = BrowserSession::InUse {
                 close_requested: true,
+                identity,
             };
         }
         BrowserSession::Empty => {}
@@ -738,7 +1561,7 @@ where
         let session = BROWSER_SESSION
             .read()
             .map_err(|e| anyhow!("获取浏览器会话读锁失败: {}", e))?;
-        let BrowserSession::Ready(browser) = &*session else {
+        let BrowserSession::Ready { browser, .. } = &*session else {
             return Err(anyhow!("浏览器尚未初始化"));
         };
         new_stealth_tab(browser)?
@@ -801,12 +1624,751 @@ mod tests {
     }
 
     #[test]
+    fn ready_session_reuses_only_compatible_profile_and_port() {
+        let executable = "/test/bin/chrome";
+        let current = BrowserSessionIdentity {
+            user_data_dir: "/tmp/profile-a".to_string(),
+            debug_port: 41000,
+            executable: executable.to_string(),
+        };
+        let compatible_auto = BrowserConfig {
+            user_data_dir: current.user_data_dir.clone(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: None,
+        };
+        let compatible_explicit = BrowserConfig {
+            debug_port: Some(current.debug_port),
+            ..compatible_auto.clone()
+        };
+        let different_port = BrowserConfig {
+            debug_port: Some(42000),
+            ..compatible_auto.clone()
+        };
+        let different_profile = BrowserConfig {
+            user_data_dir: "/tmp/profile-b".to_string(),
+            ..compatible_auto.clone()
+        };
+
+        assert_eq!(
+            ready_session_config_action_with_executable(&current, &compatible_auto, executable, 0,),
+            ReadySessionConfigAction::Reuse
+        );
+        assert_eq!(
+            ready_session_config_action_with_executable(
+                &current,
+                &compatible_explicit,
+                executable,
+                0,
+            ),
+            ReadySessionConfigAction::Reuse
+        );
+        assert_eq!(
+            ready_session_config_action_with_executable(&current, &different_port, executable, 0,),
+            ReadySessionConfigAction::Restart
+        );
+        assert_eq!(
+            ready_session_config_action_with_executable(
+                &current,
+                &different_profile,
+                executable,
+                0,
+            ),
+            ReadySessionConfigAction::Restart
+        );
+    }
+
+    #[test]
+    fn incompatible_ready_session_is_rejected_while_task_lease_is_active() {
+        let executable = "/test/bin/chrome";
+        let current = BrowserSessionIdentity {
+            user_data_dir: "/tmp/profile-a".to_string(),
+            debug_port: 41000,
+            executable: executable.to_string(),
+        };
+        let changed = BrowserConfig {
+            user_data_dir: current.user_data_dir.clone(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: Some(42000),
+        };
+
+        assert_eq!(
+            ready_session_config_action_with_executable(&current, &changed, executable, 1),
+            ReadySessionConfigAction::RejectActiveLeases
+        );
+    }
+
+    #[test]
+    fn process_profile_must_match_record_and_config_after_normalization() {
+        let config = BrowserConfig {
+            user_data_dir: "/tmp/profiles/../profile-a".to_string(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: Some(41000),
+        };
+        let record = ManagedBrowserRecord {
+            pid: 123,
+            port: 41000,
+            user_data_dir: "/tmp/profile-a".to_string(),
+        };
+        let matching = ManagedProcessEvidence {
+            pid_alive: true,
+            browser_process: true,
+            process_user_data_dir: Some("/tmp/./profile-a".to_string()),
+            port_ownership: PortOwnership::Owned,
+        };
+        let mismatching = ManagedProcessEvidence {
+            process_user_data_dir: Some("/tmp/profile-b".to_string()),
+            ..matching.clone()
+        };
+        let unreadable = ManagedProcessEvidence {
+            process_user_data_dir: None,
+            ..matching.clone()
+        };
+
+        assert_eq!(
+            managed_record_action(Some(&record), &config, &matching, true),
+            ManagedRecordAction::Reuse(41000)
+        );
+        assert_eq!(
+            managed_record_action(Some(&record), &config, &mismatching, true),
+            ManagedRecordAction::RemoveStale
+        );
+        assert_eq!(
+            managed_record_action(Some(&record), &config, &unreadable, true),
+            ManagedRecordAction::RejectUnverified
+        );
+    }
+
+    #[test]
+    fn parses_user_data_dir_from_browser_command_line() {
+        assert_eq!(
+            command_user_data_dir(
+                r#"Google Chrome --remote-debugging-port=41000 --user-data-dir="/tmp/profile a""#
+            ),
+            Some("/tmp/profile a".to_string())
+        );
+        assert_eq!(
+            command_user_data_dir(r#"chrome.exe --user-data-dir "C:\Profiles\Offer Flow""#),
+            Some(r#"C:\Profiles\Offer Flow"#.to_string())
+        );
+        assert_eq!(
+            command_user_data_dir("chrome --remote-debugging-port=1"),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_port_ownership_rejects_reuse_without_marking_record_stale() {
+        let config = BrowserConfig {
+            user_data_dir: "/tmp/profile-a".to_string(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: None,
+        };
+        let record = ManagedBrowserRecord {
+            pid: 123,
+            port: 41000,
+            user_data_dir: config.user_data_dir.clone(),
+        };
+        let evidence = ManagedProcessEvidence {
+            pid_alive: true,
+            browser_process: true,
+            process_user_data_dir: Some(config.user_data_dir.clone()),
+            port_ownership: PortOwnership::Unknown,
+        };
+
+        assert_eq!(
+            managed_record_action(Some(&record), &config, &evidence, true),
+            ManagedRecordAction::RejectUnverified
+        );
+    }
+
+    #[test]
+    fn live_same_profile_browser_on_a_different_explicit_port_blocks_launch() {
+        let config = BrowserConfig {
+            user_data_dir: "/tmp/profile-a".to_string(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: Some(42000),
+        };
+        let record = ManagedBrowserRecord {
+            pid: 123,
+            port: 41000,
+            user_data_dir: config.user_data_dir.clone(),
+        };
+        let evidence = ManagedProcessEvidence {
+            pid_alive: true,
+            browser_process: true,
+            process_user_data_dir: Some(config.user_data_dir.clone()),
+            port_ownership: PortOwnership::Owned,
+        };
+
+        assert_eq!(
+            managed_record_action(Some(&record), &config, &evidence, true),
+            ManagedRecordAction::RejectPortChange
+        );
+    }
+
+    #[test]
+    fn only_dead_or_reused_pid_records_are_stale() {
+        let config = BrowserConfig {
+            user_data_dir: "/tmp/profile-a".to_string(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: None,
+        };
+        let record = ManagedBrowserRecord {
+            pid: 123,
+            port: 41000,
+            user_data_dir: config.user_data_dir.clone(),
+        };
+        let dead = ManagedProcessEvidence {
+            pid_alive: false,
+            browser_process: false,
+            process_user_data_dir: None,
+            port_ownership: PortOwnership::Unknown,
+        };
+        let reused_pid = ManagedProcessEvidence {
+            pid_alive: true,
+            browser_process: false,
+            process_user_data_dir: Some("/tmp/unrelated-profile".to_string()),
+            port_ownership: PortOwnership::NotOwned,
+        };
+        let matching_profile_not_owned = ManagedProcessEvidence {
+            pid_alive: true,
+            browser_process: true,
+            process_user_data_dir: Some(config.user_data_dir.clone()),
+            port_ownership: PortOwnership::NotOwned,
+        };
+
+        assert_eq!(
+            managed_record_action(Some(&record), &config, &dead, false),
+            ManagedRecordAction::RemoveStale
+        );
+        assert_eq!(
+            managed_record_action(Some(&record), &config, &reused_pid, false),
+            ManagedRecordAction::RemoveStale
+        );
+        assert_eq!(
+            managed_record_action(Some(&record), &config, &matching_profile_not_owned, true,),
+            ManagedRecordAction::RejectUnverified
+        );
+    }
+
+    #[test]
+    fn linux_argv_preserves_user_data_dir_with_spaces() {
+        let args = [
+            b"/usr/bin/google-chrome".as_slice(),
+            b"--remote-debugging-port=41000".as_slice(),
+            b"--user-data-dir".as_slice(),
+            b"/home/user/Offer Flow/Profile".as_slice(),
+        ];
+
+        assert_eq!(
+            command_user_data_dir_from_argv(&args),
+            Some("/home/user/Offer Flow/Profile".to_string())
+        );
+    }
+
+    #[test]
+    fn linux_partial_proc_evidence_is_unknown_and_target_port_is_checked() {
+        let inode = "12345".to_string();
+        let matching = format!(
+            "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n   0: 0100007F:A028 00000000:0000 0A 0:0 0:0 0 0 0 {}",
+            inode
+        );
+        let non_matching_port = matching.replace("A028", "A029");
+
+        assert_eq!(
+            linux_port_ownership_from_evidence(
+                false,
+                std::slice::from_ref(&inode),
+                &[Ok(matching.clone()), Ok(String::new())],
+                41000,
+            ),
+            PortOwnership::Unknown
+        );
+        assert_eq!(
+            linux_port_ownership_from_evidence(
+                true,
+                std::slice::from_ref(&inode),
+                &[Ok(matching.clone()), Err(())],
+                41000,
+            ),
+            PortOwnership::Unknown
+        );
+        assert_eq!(
+            linux_port_ownership_from_evidence(
+                true,
+                std::slice::from_ref(&inode),
+                &[Ok("malformed".to_string()), Ok(String::new())],
+                41000,
+            ),
+            PortOwnership::Unknown
+        );
+        assert_eq!(
+            linux_port_ownership_from_evidence(
+                true,
+                std::slice::from_ref(&inode),
+                &[Ok(matching), Ok(String::new())],
+                41000,
+            ),
+            PortOwnership::Owned
+        );
+        assert_eq!(
+            linux_port_ownership_from_evidence(
+                true,
+                &[inode],
+                &[Ok(non_matching_port), Ok(String::new())],
+                41000,
+            ),
+            PortOwnership::NotOwned
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_spawned_child_kills_and_reaps_the_process() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn test child");
+
+        cleanup_spawned_child(&mut child);
+
+        assert!(
+            child.try_wait().expect("read child status").is_some(),
+            "cleanup must reap the spawned child"
+        );
+    }
+
+    #[test]
+    fn production_retry_runner_retries_automatic_but_not_explicit_ports() {
+        let mut automatic_calls = 0;
+        let automatic = run_browser_launch_attempts(true, || {
+            automatic_calls += 1;
+            if automatic_calls < 3 {
+                Err(anyhow!("not ready"))
+            } else {
+                Ok(43000)
+            }
+        });
+        assert_eq!(automatic.unwrap(), 43000);
+        assert_eq!(automatic_calls, 3);
+
+        let mut explicit_calls = 0;
+        let explicit: Result<u16> = run_browser_launch_attempts(false, || {
+            explicit_calls += 1;
+            Err(anyhow!("not ready"))
+        });
+        assert!(explicit.is_err());
+        assert_eq!(explicit_calls, 1);
+    }
+
+    #[test]
+    fn macos_ambiguous_unquoted_profile_with_spaces_is_unknown() {
+        assert_eq!(
+            macos_command_user_data_dir(
+                "Google Chrome --user-data-dir=/Users/test/Offer Flow/Profile --remote-debugging-port=41000"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_missing_explicit_ownership_result_is_unknown() {
+        assert_eq!(
+            windows_port_ownership(true, "CMD=chrome.exe --user-data-dir=C:\\profile"),
+            PortOwnership::Unknown
+        );
+        assert_eq!(
+            windows_port_ownership(true, "PORT_QUERY_OK=1\nOWNS=0"),
+            PortOwnership::NotOwned
+        );
+    }
+
+    #[test]
+    fn linux_proc_not_found_is_dead_but_other_failures_are_unknown() {
+        assert_eq!(
+            linux_cmdline_state_from_result(Err(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            ))),
+            ProcessCommandState::Dead
+        );
+        assert_eq!(
+            linux_cmdline_state_from_result(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+            ProcessCommandState::Unknown
+        );
+        assert_eq!(
+            linux_cmdline_state_from_result(Ok(Vec::new())),
+            ProcessCommandState::Unknown
+        );
+    }
+
+    #[test]
+    fn linux_empty_or_unreadable_proc_evidence_is_unknown() {
+        assert_eq!(
+            linux_port_ownership_from_evidence(false, &[], &[], 41000),
+            PortOwnership::Unknown
+        );
+        assert_eq!(linux_cmdline_state(None), ProcessCommandState::Unknown);
+        assert_eq!(linux_cmdline_state(Some(&[])), ProcessCommandState::Unknown);
+    }
+
+    #[test]
+    fn macos_lsof_exit_one_requires_clean_empty_output_for_not_owned() {
+        assert_eq!(
+            lsof_port_ownership(Some(1), b"", b""),
+            PortOwnership::NotOwned
+        );
+        assert_eq!(
+            lsof_port_ownership(Some(1), b"", b"permission denied"),
+            PortOwnership::Unknown
+        );
+        assert_eq!(
+            lsof_port_ownership(None, b"", b"tool unavailable"),
+            PortOwnership::Unknown
+        );
+    }
+
+    #[test]
+    fn live_process_with_matching_profile_and_unreachable_cdp_is_unverified() {
+        let config = BrowserConfig {
+            user_data_dir: "/tmp/profile-a".to_string(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: Some(41000),
+        };
+        let record = ManagedBrowserRecord {
+            pid: 123,
+            port: 41000,
+            user_data_dir: config.user_data_dir.clone(),
+        };
+        let evidence = ManagedProcessEvidence {
+            pid_alive: true,
+            browser_process: true,
+            process_user_data_dir: Some(config.user_data_dir.clone()),
+            port_ownership: PortOwnership::Owned,
+        };
+
+        assert_eq!(
+            managed_record_action(Some(&record), &config, &evidence, true),
+            ManagedRecordAction::Reuse(41000)
+        );
+        assert_eq!(
+            managed_record_action(Some(&record), &config, &evidence, false),
+            ManagedRecordAction::RejectUnverified
+        );
+    }
+
+    #[test]
+    fn parses_only_browser_process_identity() {
+        assert!(command_identifies_browser(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=41000"
+        ));
+        assert!(command_identifies_browser(
+            "msedge.exe --remote-debugging-port=41000"
+        ));
+        assert!(!command_identifies_browser("node unrelated-cdp-server.js"));
+    }
+
+    #[test]
+    fn inactive_cdp_skips_expensive_port_ownership_probe() {
+        let mut calls = 0;
+        let result = classify_launch_probe_with(false, || {
+            calls += 1;
+            true
+        });
+
+        assert_eq!(result, BrowserLaunchAttempt::ReadinessTimeout);
+        assert_eq!(calls, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_process_probe_times_out_and_reaps_child() {
+        let started = std::time::Instant::now();
+        let output = command_output_with_timeout(
+            Command::new("sh").args(["-c", "sleep 30"]),
+            Duration::from_millis(50),
+        )
+        .expect("run bounded command");
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn macos_missing_process_is_dead_but_probe_failures_are_unknown() {
+        assert_eq!(
+            macos_procargs_state_from_result(Err(std::io::Error::from_raw_os_error(libc::ESRCH))),
+            ProcessCommandState::Dead
+        );
+        assert_eq!(
+            macos_procargs_state_from_result(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+            ProcessCommandState::Unknown
+        );
+        assert_eq!(
+            macos_procargs_state_from_result(Ok(Vec::new())),
+            ProcessCommandState::Unknown
+        );
+    }
+
+    #[test]
+    fn macos_procargs_parser_preserves_profile_paths_with_spaces() {
+        let mut bytes = (4_i32).to_ne_bytes().to_vec();
+        bytes
+            .extend_from_slice(b"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\0\0");
+        bytes.extend_from_slice(b"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\0");
+        bytes.extend_from_slice(b"--remote-debugging-port=41000\0");
+        bytes.extend_from_slice(
+            b"--user-data-dir=/Users/test/Library/Application Support/Offer Flow/Profile\0",
+        );
+        bytes.extend_from_slice(b"--no-first-run\0");
+
+        let args = parse_macos_procargs(&bytes).expect("parse process argv");
+        let refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            command_user_data_dir_from_argv(&refs),
+            Some("/Users/test/Library/Application Support/Offer Flow/Profile".to_string())
+        );
+    }
+
+    #[test]
+    fn windows_whole_quoted_user_data_dir_argument_preserves_spaces() {
+        assert_eq!(
+            command_user_data_dir(
+                r#"chrome.exe "--user-data-dir=C:\Users\test\Application Support\Offer Flow\Profile" --remote-debugging-port=41000"#,
+            ),
+            Some(r"C:\Users\test\Application Support\Offer Flow\Profile".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_wait_refuses_cdp_not_owned_by_spawned_pid() {
+        assert_eq!(
+            classify_launch_probe(true, false),
+            BrowserLaunchAttempt::PortClaimed
+        );
+        assert_eq!(
+            classify_launch_probe(true, true),
+            BrowserLaunchAttempt::Ready(0)
+        );
+    }
+
+    #[test]
+    fn configured_debug_port_uses_explicit_value_and_zero_allocates_dynamically() {
+        let explicit = BrowserConfig {
+            user_data_dir: "/tmp/offer-flow-profile".to_string(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: Some(43210),
+        };
+        assert_eq!(select_browser_debug_port(&explicit).unwrap(), 43210);
+
+        let automatic = BrowserConfig {
+            debug_port: Some(0),
+            ..explicit
+        };
+        let port = select_browser_debug_port(&automatic).unwrap();
+        assert_ne!(port, 0);
+    }
+
+    #[test]
+    fn non_cdp_listener_is_not_treated_as_a_managed_browser() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK",
+                )
+                .unwrap();
+        });
+
+        assert!(!is_cdp_port_active(port));
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_probe_wait_errors_require_cleanup() {
+        assert_eq!(
+            child_poll_action(&Err(std::io::Error::other("probe failed"))),
+            ChildPollAction::CleanupAndFail
+        );
+    }
+
+    #[test]
+    fn executable_changes_invalidate_ready_session_identity() {
+        let current = BrowserSessionIdentity {
+            user_data_dir: "/tmp/profile".to_string(),
+            debug_port: 41000,
+            executable: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string(),
+        };
+        let config = BrowserConfig {
+            user_data_dir: current.user_data_dir.clone(),
+            chrome_exe_path: Some(
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge".to_string(),
+            ),
+            max_parallel_tasks: 2,
+            debug_port: Some(41000),
+        };
+        assert_eq!(
+            ready_session_config_action_with_executable(
+                &current,
+                &config,
+                &config.chrome_exe_path.clone().unwrap(),
+                0,
+            ),
+            ReadySessionConfigAction::Restart
+        );
+    }
+
+    #[test]
+    fn missing_record_allows_launch_but_corrupt_record_fails_closed() {
+        assert!(matches!(
+            managed_record_load_from_result(Err(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            ))),
+            ManagedRecordLoad::Missing
+        ));
+        assert!(matches!(
+            managed_record_load_from_result(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+            ManagedRecordLoad::Unverified
+        ));
+        assert!(matches!(
+            managed_record_load_from_result(Ok("not json".to_string())),
+            ManagedRecordLoad::Unverified
+        ));
+    }
+
+    #[test]
+    fn recorded_managed_browser_is_reused_only_when_cdp_and_profile_match() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::{Read, Write};
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            let body = r#"{"Browser":"Chrome/120","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/browser/test"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let config = BrowserConfig {
+            user_data_dir: "/tmp/offer-flow-profile".to_string(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: None,
+        };
+        let record = ManagedBrowserRecord {
+            pid: 123,
+            port,
+            user_data_dir: config.user_data_dir.clone(),
+        };
+
+        let error = reusable_managed_browser_port(Some(&record), &config)
+            .expect_err("unverifiable managed records must fail closed");
+        assert!(error.to_string().contains("无法验证受管浏览器"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_debug_port_does_not_reuse_a_recorded_different_port() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        use std::io::{Read, Write};
+                        let mut request = [0_u8; 512];
+                        let _ = stream.read(&mut request);
+                        let body = r#"{"Browser":"Chrome/120","webSocketDebuggerUrl":"ws://127.0.0.1/devtools/browser/test"}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept CDP test connection: {error}"),
+                }
+            }
+        });
+        let config = BrowserConfig {
+            user_data_dir: "/tmp/offer-flow-profile".to_string(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: Some(43210),
+        };
+        let record = ManagedBrowserRecord {
+            pid: 123,
+            port,
+            user_data_dir: config.user_data_dir.clone(),
+        };
+
+        assert_eq!(
+            managed_record_action(
+                Some(&record),
+                &config,
+                &ManagedProcessEvidence {
+                    pid_alive: true,
+                    browser_process: true,
+                    process_user_data_dir: Some(config.user_data_dir.clone()),
+                    port_ownership: PortOwnership::Owned,
+                },
+                true,
+            ),
+            ManagedRecordAction::RejectPortChange
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_debug_port_rejects_a_different_active_port() {
+        let config = BrowserConfig {
+            user_data_dir: "/tmp/offer-flow-profile".to_string(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+            debug_port: Some(43210),
+        };
+
+        assert!(!configured_port_allows_reuse(&config, 50000));
+        assert!(configured_port_allows_reuse(&config, 43210));
+    }
+
+    #[test]
     fn allocates_a_nonzero_local_debug_port() {
         let port = allocate_browser_debug_port().expect("allocate browser debug port");
 
         assert_ne!(port, 0);
-        let _listener = TcpListener::bind(("127.0.0.1", port))
-            .expect("allocated browser debug port should be available");
     }
 
     #[test]
@@ -831,10 +2393,11 @@ mod tests {
             user_data_dir: "/tmp/offer-flow-profile".to_string(),
             chrome_exe_path: None,
             max_parallel_tasks: 2,
+            debug_port: None,
         };
         let record = ManagedBrowserRecord {
             pid: 123,
-            port: DEFAULT_RPA_DEBUG_PORT,
+            port: 43210,
             user_data_dir: config.user_data_dir.clone(),
         };
 

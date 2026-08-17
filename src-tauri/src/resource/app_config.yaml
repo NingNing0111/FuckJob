@@ -107,6 +107,7 @@ browser_config:
   user_data_dir: ""
   chrome_exe_path: ""
   max_parallel_tasks: 2
+  debug_port: 0
 resume_config: &default_resume
   inject_llm_context: true
   resume_path: ""

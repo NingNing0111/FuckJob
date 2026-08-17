@@ -1615,6 +1615,22 @@ export function ConfigPage(props: ConfigPageProps) {
               />
             </Form.Item>
             <Form.Item
+              label="浏览器调试端口"
+              name={["browser_config", "debug_port"]}
+              extra="留空或填写 0 时自动分配可用端口；仅在需要固定 DevTools 端口时填写 1～65535。"
+            >
+              <InputNumber
+                min={0}
+                max={65535}
+                precision={0}
+                placeholder="自动分配"
+                style={{ width: "100%" }}
+                onChange={(value) =>
+                  props.updateBrowser({ debug_port: value ?? null })
+                }
+              />
+            </Form.Item>
+            <Form.Item
               label="最大并行任务数"
               name={["browser_config", "max_parallel_tasks"]}
               extra="默认为 2, BOSS 与猎聘可各运行一个任务、同一平台的后续任务会排队。"

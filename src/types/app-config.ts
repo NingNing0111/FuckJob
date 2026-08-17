@@ -145,6 +145,7 @@ export interface BrowserConfig {
   user_data_dir: string;
   chrome_exe_path: string | null;
   max_parallel_tasks: number;
+  debug_port?: number | null;
 }
 
 export interface ResumeConfig {

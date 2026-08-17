@@ -46,5 +46,6 @@ tempfile = "3.27.0"
 zip = "2.2.0"
 rig = { version = "0.40.0", default-features = false, features = ["reqwest", "native-tls"] }
 futures = "0.3.30"
+libc = "0.2"
 
 [dev-dependencies]

@@ -97,6 +97,7 @@ pub fn default_app_config() -> AppRuntimeConfig {
             user_data_dir: "".to_string(),
             chrome_exe_path: None,
             max_parallel_tasks: default_max_parallel_tasks(),
+            debug_port: None,
         },
         resume_config,
     }
@@ -1179,6 +1180,9 @@ pub struct BrowserConfig {
     /// 同时执行的自动化任务上限。当前仅开放跨平台双任务并行。
     #[serde(default = "default_max_parallel_tasks")]
     pub max_parallel_tasks: usize,
+    /// Chrome DevTools 调试端口。未配置或为 0 时自动分配可用端口。
+    #[serde(default)]
+    pub debug_port: Option<u16>,
 }
 
 fn normalize_job_profiles(config: &mut AppRuntimeConfig) -> Result<(), String> {
@@ -2004,6 +2008,27 @@ job_profiles: []
             config.llm_retry_config.retry_base_delay_ms,
             MAX_RETRY_BASE_DELAY_MS
         );
+    }
+
+    #[test]
+    fn browser_debug_port_defaults_to_dynamic_and_preserves_explicit_values() {
+        let legacy = parse_config_content(
+            "schema_version: 2\nbrowser_config:\n  user_data_dir: profile\n  chrome_exe_path: null\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.browser_config.debug_port, None);
+
+        let automatic = parse_config_content(
+            "schema_version: 2\nbrowser_config:\n  user_data_dir: profile\n  debug_port: 0\n",
+        )
+        .unwrap();
+        assert_eq!(automatic.browser_config.debug_port, Some(0));
+
+        let explicit = parse_config_content(
+            "schema_version: 2\nbrowser_config:\n  user_data_dir: profile\n  debug_port: 43210\n",
+        )
+        .unwrap();
+        assert_eq!(explicit.browser_config.debug_port, Some(43210));
     }
 
     #[test]

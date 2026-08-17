@@ -5813,6 +5813,7 @@ dependencies = [
  "futures",
  "keyring",
  "kreuzberg",
+ "libc",
  "once_cell",
  "regex",
  "rig",
