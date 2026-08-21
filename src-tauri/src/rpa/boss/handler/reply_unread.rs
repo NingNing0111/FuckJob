@@ -16,7 +16,11 @@ use crate::{
     logger,
     rpa::{
         boss::{
-            handler::{actions::BossActions, chat_list, chat_list::ListState, send_messages},
+            handler::{
+                actions::BossActions,
+                chat_list::{self, ListState},
+                send_messages,
+            },
             model::{ChatMessage, UnreadChat},
             BOSS_CHAT_URL,
         },
@@ -47,9 +51,7 @@ pub async fn reply_unread_on_page(
     app_runtime_config: &AppRuntimeConfig,
 ) -> Result<Vec<UnreadChat>, anyhow::Error> {
     let app_runtime_config = app_runtime_config.clone();
-    logger::info("正在打开沟通页面")?;
-    page.get(BOSS_CHAT_URL).context("打开 BOSS 沟通页面失败")?;
-    chat_list::wait_for_chat_page(page, Duration::from_secs(20))?;
+    ensure_chat_page(page)?;
 
     // 每轮重新拉一次未读列表再处理一个会话。两个原因：点开会话会让它变已读、
     // 从未读列表消失，整列 DOM 跟着重排，一次性取出的卡片快照从第二个起就指向
@@ -154,6 +156,78 @@ pub async fn reply_unread_on_page(
         sleep_random_ms(3000, 5000);
     }
     Ok(Vec::new())
+}
+
+trait ChatPageDriver {
+    fn labels_ready(&mut self) -> Result<bool, anyhow::Error>;
+    fn navigate(&mut self) -> Result<(), anyhow::Error>;
+    fn wait_until_ready(&mut self) -> Result<(), anyhow::Error>;
+    fn info(&mut self, message: &str) -> Result<(), anyhow::Error>;
+    fn warning(&mut self, message: &str) -> Result<(), anyhow::Error>;
+}
+
+struct BrowserChatPageDriver<'a> {
+    page: &'a rust_drission::Page,
+}
+
+impl ChatPageDriver for BrowserChatPageDriver<'_> {
+    fn labels_ready(&mut self) -> Result<bool, anyhow::Error> {
+        chat_list::is_chat_page_ready(self.page).context("探测 BOSS 沟通页状态失败")
+    }
+
+    fn navigate(&mut self) -> Result<(), anyhow::Error> {
+        self.page
+            .get(BOSS_CHAT_URL)
+            .context("打开 BOSS 沟通页面失败")
+    }
+
+    fn wait_until_ready(&mut self) -> Result<(), anyhow::Error> {
+        chat_list::wait_for_chat_page(self.page, Duration::from_secs(20))
+    }
+
+    fn info(&mut self, message: &str) -> Result<(), anyhow::Error> {
+        logger::info(message)
+    }
+
+    fn warning(&mut self, message: &str) -> Result<(), anyhow::Error> {
+        logger::warning(message)
+    }
+}
+
+/// 优先复用 owned tab 中已经就绪的沟通页。只有分类标签不存在时才冷导航；
+/// 首次等待失败后再做一次受控恢复，第二次仍失败就把两次上下文一起返回。
+fn ensure_chat_page(page: &rust_drission::Page) -> Result<(), anyhow::Error> {
+    ensure_chat_page_with(&mut BrowserChatPageDriver { page })
+}
+
+fn ensure_chat_page_with(driver: &mut impl ChatPageDriver) -> Result<(), anyhow::Error> {
+    if driver.labels_ready()? {
+        driver.info("沟通页面已就绪，复用当前页面")?;
+        return Ok(());
+    }
+
+    driver.info("正在打开沟通页面")?;
+    driver.navigate()?;
+    match driver.wait_until_ready() {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            driver.warning(&format!(
+                "沟通页面首次加载未就绪，执行一次受控恢复：{first_error:#}"
+            ))?;
+
+            if let Err(recovery_navigation_error) = driver.navigate() {
+                return Err(anyhow!(
+                    "BOSS 沟通页恢复失败；首次等待：{first_error:#}；恢复导航：{recovery_navigation_error:#}"
+                ));
+            }
+
+            driver.wait_until_ready().map_err(|recovery_error| {
+                anyhow!(
+                    "BOSS 沟通页两次加载均未就绪；首次等待：{first_error:#}；恢复等待：{recovery_error:#}"
+                )
+            })
+        }
+    }
 }
 
 /// 处理单个已打开的会话。
@@ -613,6 +687,115 @@ fn mark_resume_sent(job_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    struct FakeChatPageDriver {
+        labels_ready: bool,
+        wait_results: VecDeque<Result<(), &'static str>>,
+        navigate_results: VecDeque<Result<(), &'static str>>,
+        navigate_calls: usize,
+        wait_calls: usize,
+    }
+
+    impl FakeChatPageDriver {
+        fn new(labels_ready: bool, waits: &[Result<(), &'static str>]) -> Self {
+            Self {
+                labels_ready,
+                wait_results: waits.iter().cloned().collect(),
+                navigate_results: VecDeque::new(),
+                navigate_calls: 0,
+                wait_calls: 0,
+            }
+        }
+    }
+
+    impl ChatPageDriver for FakeChatPageDriver {
+        fn labels_ready(&mut self) -> Result<bool, anyhow::Error> {
+            Ok(self.labels_ready)
+        }
+
+        fn navigate(&mut self) -> Result<(), anyhow::Error> {
+            self.navigate_calls += 1;
+            self.navigate_results
+                .pop_front()
+                .unwrap_or(Ok(()))
+                .map_err(anyhow::Error::msg)
+        }
+
+        fn wait_until_ready(&mut self) -> Result<(), anyhow::Error> {
+            self.wait_calls += 1;
+            self.wait_results
+                .pop_front()
+                .expect("测试必须为每次等待提供结果")
+                .map_err(anyhow::Error::msg)
+        }
+
+        fn info(&mut self, _message: &str) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        fn warning(&mut self, _message: &str) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ready_chat_page_is_reused_without_navigation() {
+        let mut driver = FakeChatPageDriver::new(true, &[]);
+
+        ensure_chat_page_with(&mut driver).expect("已就绪页面应直接复用");
+
+        assert_eq!(driver.navigate_calls, 0);
+        assert_eq!(driver.wait_calls, 0);
+    }
+
+    #[test]
+    fn cold_chat_page_navigates_once_when_first_wait_succeeds() {
+        let mut driver = FakeChatPageDriver::new(false, &[Ok(())]);
+
+        ensure_chat_page_with(&mut driver).expect("首次加载成功");
+
+        assert_eq!(driver.navigate_calls, 1);
+        assert_eq!(driver.wait_calls, 1);
+    }
+
+    #[test]
+    fn first_timeout_recovers_with_exactly_one_extra_navigation() {
+        let mut driver = FakeChatPageDriver::new(false, &[Err("首次超时"), Ok(())]);
+
+        ensure_chat_page_with(&mut driver).expect("恢复加载成功");
+
+        assert_eq!(driver.navigate_calls, 2);
+        assert_eq!(driver.wait_calls, 2);
+    }
+
+    #[test]
+    fn recovery_navigation_failure_preserves_wait_and_navigation_contexts() {
+        let mut driver = FakeChatPageDriver::new(false, &[Err("首次分类标签超时")]);
+        driver.navigate_results = vec![Ok(()), Err("恢复导航失败")].into_iter().collect();
+
+        let error = ensure_chat_page_with(&mut driver).expect_err("恢复导航失败必须终止");
+        let message = format!("{error:#}");
+
+        assert_eq!(driver.navigate_calls, 2);
+        assert_eq!(driver.wait_calls, 1);
+        assert!(message.contains("首次分类标签超时"), "{message}");
+        assert!(message.contains("恢复导航失败"), "{message}");
+    }
+
+    #[test]
+    fn two_timeouts_stop_and_preserve_both_error_contexts() {
+        let mut driver =
+            FakeChatPageDriver::new(false, &[Err("首次分类标签超时"), Err("恢复分类标签超时")]);
+
+        let error = ensure_chat_page_with(&mut driver).expect_err("两次超时必须失败");
+        let message = format!("{error:#}");
+
+        assert_eq!(driver.navigate_calls, 2);
+        assert_eq!(driver.wait_calls, 2);
+        assert!(message.contains("首次分类标签超时"), "{message}");
+        assert!(message.contains("恢复分类标签超时"), "{message}");
+    }
 
     #[test]
     fn parses_and_detects_resume_attachment_messages() {
