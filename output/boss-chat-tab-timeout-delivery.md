@@ -8,7 +8,7 @@
 
 ## 交付范围
 - 目标：定位 BOSS 周期间歇自动回复反复等待会话分类标签超时的根因，实施稳健修复并验证
-- 路由：class=debug · kind=bugfix · depth=standard
+- 路由：class=quick_edit · kind=light · depth=fast
 - 计划 boss-chat-tab-timeout：3/3 done · 0 blocked · 0 未结算
   - [done] diagnose 追踪沟通页面导航、分类标签等待与周期重试链路，形成根因诊断（backend-engineer，验收 source-present）
   - [done] fix 修复分类标签就绪判定与异常恢复逻辑并补充回归测试（backend-engineer，验收 build-test）
@@ -17,8 +17,10 @@
 ## 关键文件
 - src-tauri/src/rpa/boss/handler/chat_list.rs（主会话声明的改动）
 - src-tauri/src/rpa/boss/handler/reply_unread.rs（主会话声明的改动）
+- output/boss-chat-tab-timeout-diagnosis.md（主会话声明的改动）
 - output/boss-chat-tab-timeout-fix.md（主会话声明的改动）
 - output/boss-chat-tab-timeout-review.md（主会话声明的改动）
+- output/boss-chat-tab-timeout-delivery.md（主会话声明的改动）
 
 ## 验证
 - [diagnose] source-present → pass
@@ -46,9 +48,9 @@
 - `.pi/dev/plan.json`：计划 DAG 与每步状态（可恢复）
 - `.pi/dev/route.json`：本次路由定级与理由
 - `.pi/dev/ledger.jsonl`：append-only 审计账本（路由 / 验收 / 评审 / 确认门 / 交付）
-- 验收报告 4 份，最近一次 review @ 2026-08-21T06:09:15.477Z
+- 验收报告 4 份，最近一次 review @ 2026-08-21T07:58:33.203Z
 - `.pi/dev/evidence/`：命令完整输出（报告中的 output 已截断）
-- 评审报告 2 份，含各席位 accepts / blocking / advisory / evidence 原文
+- 评审报告 1 份，含各席位 accepts / blocking / advisory / evidence 原文
 - `.pi/dev/blackboard.md`：当前黑板（合同、实际状态、finding、待确认项）
 
 ## 恢复/继续
