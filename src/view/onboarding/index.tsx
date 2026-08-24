@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Alert, Button, Card, Space, Typography } from "antd";
-import type { AppRuntimeConfig } from "@/types/app-config";
+import { isLlmServiceUsable, type AppRuntimeConfig } from "@/types/app-config";
 import type { BrowserEnvStatus } from "@/types/rpa";
 import type { CommandResult } from "@/types/command";
 import { setLlmApiKey } from "@/lib/llmConfig";
@@ -36,7 +36,18 @@ export function Onboarding({ config, onFinish }: { config: AppRuntimeConfig; onF
         }
         setPendingApiKey("");
       }
-      const saved = await onFinish({ ...draft, onboarding_completed: true, llm_config: llm });
+      const saved = await onFinish({
+        ...draft,
+        onboarding_completed: true,
+        llm_config: llm,
+        // compact 引导页不展示降级链；选择跳过 AI 时一并放弃历史备用草稿，
+        // 避免隐藏的半成品备用服务让用户永远无法完成引导。
+        llm_fallbacks: llm === null
+          ? []
+          // compact 模式没有备用服务编辑区，只保留历史配置里已经完整的条目；
+          // 半成品留到这里会阻止完成引导，用户却没有入口修复。
+          : (draft.llm_fallbacks ?? []).filter(isLlmServiceUsable),
+      });
       if (!saved) setFinishError("配置保存失败，请检查配置后重试");
     } catch (error) {
       setFinishError(error instanceof Error ? error.message : "进入应用失败，请重试");
@@ -58,7 +69,18 @@ export function Onboarding({ config, onFinish }: { config: AppRuntimeConfig; onF
     </Space>}
     {step === 2 && <Space direction="vertical" size="large" style={{ width: "100%", marginTop: 32 }}>
       <Alert type="info" message="AI 配置可随时跳过" description="选择六种预设之一，填写模型并完成真实连接测试；失败不会阻止使用本地功能。" />
-      <LlmConfigPanel config={draft.llm_config} onChange={(llm_config) => setDraft((v) => ({ ...v, llm_config }))} onPersist={async (llm_config) => onFinish({ ...draft, onboarding_completed: false, llm_config })} onPendingApiKeyChange={setPendingApiKey} compact />
+      <LlmConfigPanel
+        config={draft.llm_config}
+        onChange={(llm_config) => setDraft((v) => ({ ...v, llm_config }))}
+        onPersist={async (llm_config) => onFinish({
+          ...draft,
+          onboarding_completed: false,
+          llm_config,
+          llm_fallbacks: (draft.llm_fallbacks ?? []).filter(isLlmServiceUsable),
+        })}
+        onPendingApiKeyChange={setPendingApiKey}
+        compact
+      />
       <Space><Button type="primary" loading={finishing} disabled={!isValidLlmConfig(draft.llm_config)} onClick={() => void finish()}>完成并进入应用</Button><Button loading={finishing} onClick={() => void finish(null)}>跳过 AI，进入应用</Button></Space>
     </Space>}
     {finishError && <Alert style={{ marginTop: 16 }} type="error" showIcon message={finishError} />}

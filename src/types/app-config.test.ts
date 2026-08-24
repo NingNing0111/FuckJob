@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   copyJobProfile,
+  getAppConfigSaveValidationError,
   getDefaultJobProfile,
   getJobProfiles,
   getReplyPollingConfig,
@@ -9,6 +10,44 @@ import {
   DEFAULT_REPLY_POLLING_CONFIG,
   type AppRuntimeConfig,
 } from "./app-config";
+
+describe("app config save validation", () => {
+  const primary = {
+    provider: "openai" as const,
+    base_url: "https://api.openai.com/v1",
+    model: "gpt-test",
+  };
+  const fallback = {
+    id: "backup-a",
+    label: null,
+    provider: "deepseek" as const,
+    base_url: "https://api.deepseek.com",
+    model: "deepseek-chat",
+    enabled: true,
+  };
+
+  it("accepts the intentional no-model state", () => {
+    expect(getAppConfigSaveValidationError({ llm_config: null, llm_fallbacks: [] })).toBeNull();
+  });
+
+  it("reports the first missing primary field", () => {
+    expect(getAppConfigSaveValidationError({
+      llm_config: { ...primary, base_url: "  " },
+      llm_fallbacks: [],
+    })).toBe("主用模型的服务地址不能为空");
+    expect(getAppConfigSaveValidationError({
+      llm_config: { ...primary, model: "\t" },
+      llm_fallbacks: [],
+    })).toBe("主用模型的模型名称不能为空");
+  });
+
+  it("requires every retained fallback to be complete, including disabled entries", () => {
+    expect(getAppConfigSaveValidationError({
+      llm_config: primary,
+      llm_fallbacks: [fallback, { ...fallback, id: "backup-b", model: "", enabled: false }],
+    })).toBe("备用模型 2 的模型名称不能为空");
+  });
+});
 
 const legacyConfig = {
   default_job_profile_id: undefined,

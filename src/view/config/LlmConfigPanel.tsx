@@ -20,6 +20,7 @@ import {
   MIN_RETRY_BASE_DELAY_MS,
   MIN_LLM_REQUEST_TIMEOUT_SECONDS,
   PRIMARY_LLM_ENTRY_ID,
+  getAppConfigSaveValidationError,
   isLlmServiceUsable,
   type LlmConfig,
   type LlmProviderEntry,
@@ -404,19 +405,66 @@ export function LlmConfigPanel({
     setActiveKeys((keys) => [...keys, entry.id]);
   };
 
+  /**
+   * 交换凭据前，先确认整条链完整并把已有草稿落盘。这样链中另一条半成品
+   * 不会在交换后阻断自动保存，造成磁盘配置仍是旧顺序、凭据却已换位。
+   */
+  const prepareCredentialMutation = async (): Promise<boolean> => {
+    const validationError = getAppConfigSaveValidationError({
+      llm_config: config,
+      llm_fallbacks: chain,
+    });
+    if (validationError) {
+      showFeedback("warning", "暂时无法调整模型顺序", `配置未保存：${validationError}。请先补全或删除该服务。`);
+      return false;
+    }
+    if (!dirty) return true;
+    if (!onPersistAll) {
+      showFeedback("error", "暂时无法调整模型顺序", "请先保存当前配置后再试");
+      return false;
+    }
+    if (!await onPersistAll()) {
+      showFeedback("error", "暂时无法调整模型顺序", "当前配置保存失败，尚未改动任何 API Key");
+      return false;
+    }
+    return true;
+  };
+
+  const removePrimaryConfig = () => {
+    const fallbackCount = chain.length;
+    Modal.confirm({
+      title: "移除大模型配置？",
+      width: 520,
+      content: fallbackCount > 0
+        ? `主用服务和 ${fallbackCount} 个备用服务会从配置中移除。已保存的 API Key 仍保留在系统凭据库中。`
+        : "主用服务会从配置中移除。已保存的 API Key 仍保留在系统凭据库中。",
+      okText: "移除配置",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      onOk: () => {
+        onChange(null);
+        // 清掉显式停用标记；若用户随后马上新建服务，编辑区仍应保持展开。
+        onEnabledChange?.(true);
+        onFallbacksChange?.([]);
+        setModels({});
+        setConnectionOk({});
+        setActiveKeys([]);
+      },
+    });
+  };
+
   const removeFallback = (index: number) => {
     const entry = chain[index];
     if (!entry) return;
     Modal.confirm({
       title: `删除「${fallbackTitle(entry, index)}」？`,
-      content: "该服务在系统凭据库里保存的 API Key 会一并清除，避免留下无人使用的密钥。",
+      content: "该服务会从降级链中移除；已保存的 API Key 仍保留在系统凭据库中，避免配置尚未落盘时丢失凭据。",
       okText: "删除",
       okButtonProps: { danger: true },
       cancelText: "取消",
-      onOk: async () => {
-        await clearLlmApiKeyFor(entry.id).catch(() => undefined);
+      onOk: () => {
         onFallbacksChange?.(chain.filter((_, i) => i !== index));
-        showFeedback("success", "备用服务已删除", `已删除「${fallbackTitle(entry, index)}」及其 API Key`);
+        showFeedback("success", "备用服务已删除", `已从配置中删除「${fallbackTitle(entry, index)}」；API Key 保留在系统凭据库中`);
       },
     });
   };
@@ -446,6 +494,7 @@ export function LlmConfigPanel({
       okText: "交换",
       cancelText: "取消",
       onOk: async () => {
+        if (!await prepareCredentialMutation()) return;
         // 先算出交换结果，确认可行再动密钥；反过来一旦交换失败，
         // 密钥已经被搬走，配置却没变，两边就对不上了。
         const swapped = promoteFallbackToPrimary(config, chain, index);
@@ -609,7 +658,10 @@ export function LlmConfigPanel({
                     配置主用模型服务，连接失败时会按下方顺序切换备用服务。
                   </Typography.Text>
                 </div>
-                <Tag color="blue" className="!mr-0">主用</Tag>
+                <Space size={8}>
+                  <Tag color="blue" className="!mr-0">主用</Tag>
+                  <Button size="small" type="text" danger onClick={removePrimaryConfig}>移除配置</Button>
+                </Space>
               </div>
 
               <div className="grid grid-cols-1 gap-x-4 md:grid-cols-2">
@@ -641,7 +693,7 @@ export function LlmConfigPanel({
                   type="info"
                   showIcon
                   message="补齐服务地址和模型后，大模型才会启用"
-                  description="当前填写的内容会照常保存，随时可以回来接着配。模型名可以直接输入，也可以点「获取模型」从服务拉取。"
+                  description="补齐前不会触发自动保存；补齐后会自动保存。模型名可以直接输入，也可以点「获取模型」从服务拉取。"
                 />
               )}
             </section>
@@ -733,7 +785,7 @@ export function LlmConfigPanel({
                       type="warning"
                       showIcon
                       message="有备用服务尚未填写完整"
-                      description="缺服务地址或模型名的备用服务会照常保存，但不会参与降级，补齐后自动生效。"
+                      description="缺服务地址或模型名时不会触发自动保存；补齐或删除该备用服务后会自动保存。"
                     />
                   )}
                 </div>

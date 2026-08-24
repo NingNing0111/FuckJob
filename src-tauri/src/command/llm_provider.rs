@@ -488,7 +488,7 @@ mod tests {
     fn find_chain_link_reports_an_unusable_service_clearly() {
         let chain = chain();
 
-        // 草稿也会落盘，所以链里没有它多半是缺地址或模型名，错误文案要直接指向该补什么
+        // 历史坏配置可能被宽容读取为草稿；链里没有它时，错误文案要直接指向该补什么。
         let error = find_chain_link(&chain, "backup-incomplete").unwrap_err();
 
         assert_eq!(error.code, AppErrorCode::Configuration);

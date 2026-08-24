@@ -564,6 +564,9 @@ export function ConfigPage(props: ConfigPageProps) {
     profiles.length > 1 && activeProfile.id !== defaultProfileId;
   const llmConfigured = isLlmConfigured(props.config);
   const llmActive = isLlmActive(props.config);
+  // 「是否启用」与「当前是否填完整可调用」是两件事。模型名被清空时仍要保持
+  // 编辑区展开，用户才能补回模型名或放弃这份配置。
+  const llmEnabled = props.config.llm_enabled !== false;
 
   const showNotice = (
     type: "success" | "error" | "info" | "warning",
@@ -909,7 +912,7 @@ export function ConfigPage(props: ConfigPageProps) {
         return (
           <LlmConfigPanel
             config={props.config.llm_config}
-            enabled={llmActive}
+            enabled={llmEnabled}
             onChange={props.updateLlm}
             onEnabledChange={(enabled) =>
               props.updateLlmEnabled(enabled ? undefined : false)

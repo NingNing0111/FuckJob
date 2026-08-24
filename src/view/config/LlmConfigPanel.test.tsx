@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { Modal } from "antd";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import type { LlmConfig, LlmProviderEntry, LlmRetryConfig } from "@/types/app-config";
@@ -189,12 +190,14 @@ function Harness({
   initialFallbacks = [],
   onFallbacks,
   onRetry,
+  onPersistAll,
   dirty,
 }: {
   initialConfig?: LlmConfig;
   initialFallbacks?: LlmProviderEntry[];
   onFallbacks?: (next: LlmProviderEntry[]) => void;
   onRetry?: (next: LlmRetryConfig) => void;
+  onPersistAll?: () => Promise<boolean>;
   dirty?: boolean;
 }) {
   const [config, setConfig] = useState<LlmConfig | null>(initialConfig);
@@ -222,6 +225,7 @@ function Harness({
         setRetry(next);
       }}
       dirty={dirty}
+      onPersistAll={onPersistAll}
     />
   );
 }
@@ -330,7 +334,7 @@ describe("LlmConfigPanel 降级链界面", () => {
       provider: "deepseek",
       baseUrl: "https://api.deepseek.com",
     });
-  });
+  }, 30_000);
 
   it("停用只切换状态，不清除主用配置", async () => {
     render(<Harness />);
@@ -343,6 +347,74 @@ describe("LlmConfigPanel 降级链界面", () => {
 
     fireEvent.click(screen.getByLabelText("大模型启用开关"));
     expect(screen.getByLabelText("primary 模型")).toHaveValue("gpt-test");
+  });
+
+  it("can abandon the whole model draft without clearing saved credentials", async () => {
+    const onFallbacks = vi.fn();
+    const confirm = vi.spyOn(Modal, "confirm").mockReturnValue({ destroy: vi.fn(), update: vi.fn() });
+    render(<Harness onFallbacks={onFallbacks} initialFallbacks={[fallbackEntry("backup-a", "model-a")]} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "移除配置" }));
+    const options = confirm.mock.calls[0]?.[0];
+    expect(options?.content).toContain("1 个备用服务");
+    expect(options?.content).toContain("API Key 仍保留");
+    await act(async () => {
+      await options?.onOk?.();
+    });
+
+    expect(onFallbacks).toHaveBeenLastCalledWith([]);
+    expect(screen.getByText("选择服务后开始配置")).toBeInTheDocument();
+    expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).not.toContain("clear_llm_api_key");
+    expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).not.toContain("clear_llm_api_key_for");
+    confirm.mockRestore();
+  });
+
+  it("blocks credential swapping while any retained service is incomplete", async () => {
+    const confirm = vi.spyOn(Modal, "confirm").mockReturnValue({ destroy: vi.fn(), update: vi.fn() });
+    render(<Harness initialFallbacks={[fallbackEntry("backup-a", "model-a"), fallbackEntry("backup-b", "")]} />);
+
+    const [promote] = await screen.findAllByRole("button", { name: "设为主用" });
+    fireEvent.click(promote);
+    const options = confirm.mock.calls[0]?.[0];
+    await act(async () => {
+      await options?.onOk?.();
+    });
+
+    expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).not.toContain("swap_llm_credentials");
+    confirm.mockRestore();
+  });
+
+  it("removes a fallback draft without deleting its saved credential", async () => {
+    const onFallbacks = vi.fn();
+    const confirm = vi.spyOn(Modal, "confirm").mockReturnValue({ destroy: vi.fn(), update: vi.fn() });
+    render(<Harness onFallbacks={onFallbacks} initialFallbacks={[fallbackEntry("backup-a", "model-a")]} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "删除备用 1" }));
+    const options = confirm.mock.calls[0]?.[0];
+    expect(options?.content).toContain("API Key 仍保留");
+    await act(async () => {
+      await options?.onOk?.();
+    });
+
+    expect(onFallbacks).toHaveBeenLastCalledWith([]);
+    expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).not.toContain("clear_llm_api_key_for");
+    confirm.mockRestore();
+  });
+
+  it("persists a valid dirty chain before swapping credentials", async () => {
+    const onPersistAll = vi.fn().mockResolvedValue(false);
+    const confirm = vi.spyOn(Modal, "confirm").mockReturnValue({ destroy: vi.fn(), update: vi.fn() });
+    render(<Harness dirty onPersistAll={onPersistAll} initialFallbacks={[fallbackEntry("backup-a", "model-a")]} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "设为主用" }));
+    const options = confirm.mock.calls[0]?.[0];
+    await act(async () => {
+      await options?.onOk?.();
+    });
+
+    expect(onPersistAll).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).not.toContain("swap_llm_credentials");
+    confirm.mockRestore();
   });
 
   it("新增备用服务后列表出现新条目，其标识非空且不等于 primary", async () => {

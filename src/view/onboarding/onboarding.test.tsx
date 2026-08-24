@@ -42,6 +42,51 @@ describe("Onboarding", () => {
     await waitFor(() => expect(onFinish).toHaveBeenCalledWith(expect.objectContaining({ onboarding_completed: true, llm_config: null })));
   });
 
+  it("drops hidden historical fallback drafts when skipping AI", async () => {
+    const onFinish = vi.fn().mockResolvedValue(true);
+    const historical = {
+      ...config,
+      llm_fallbacks: [{
+        id: "backup-a",
+        label: null,
+        provider: "deepseek" as const,
+        base_url: "https://api.deepseek.com",
+        model: "",
+        enabled: true,
+      }],
+    };
+    render(<Onboarding config={historical} onFinish={onFinish} />);
+    fireEvent.click(screen.getByRole("button", { name: "跳过 AI，进入应用" }));
+
+    await waitFor(() => expect(onFinish).toHaveBeenCalledWith(expect.objectContaining({
+      onboarding_completed: true,
+      llm_config: null,
+      llm_fallbacks: [],
+    })));
+  });
+
+  it("keeps complete hidden fallbacks but drops incomplete ones when finishing with a primary model", async () => {
+    const onFinish = vi.fn().mockResolvedValue(true);
+    const configured = {
+      ...config,
+      llm_config: { provider: "openai" as const, base_url: "https://api.openai.com/v1", model: "gpt-test" },
+      llm_fallbacks: [
+        { id: "backup-ok", label: null, provider: "deepseek" as const, base_url: "https://api.deepseek.com", model: "deepseek-chat", enabled: true },
+        { id: "backup-draft", label: null, provider: "deepseek" as const, base_url: "https://api.deepseek.com", model: "", enabled: true },
+      ],
+    };
+    render(<Onboarding config={configured} onFinish={onFinish} />);
+    fireEvent.click(screen.getByRole("button", { name: /继\s*续/ }));
+    await waitFor(() => expect(screen.getByText("已检测到 Chrome")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "继续配置" }));
+    fireEvent.click(screen.getByRole("button", { name: "完成并进入应用" }));
+
+    await waitFor(() => expect(onFinish).toHaveBeenCalledWith(expect.objectContaining({
+      onboarding_completed: true,
+      llm_fallbacks: [configured.llm_fallbacks[0]],
+    })));
+  });
+
   it("automatically saves a pending API key before entering the app", async () => {
     const configured = {
       ...config,
@@ -55,8 +100,10 @@ describe("Onboarding", () => {
     fireEvent.click(screen.getByRole("button", { name: "输入密钥" }));
     fireEvent.click(screen.getByRole("button", { name: "完成并进入应用" }));
 
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("set_llm_api_key", { apiKey: "secret-key" }));
-    expect(onFinish).toHaveBeenCalledWith(expect.objectContaining({ onboarding_completed: true }));
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith("set_llm_api_key", { apiKey: "secret-key" });
+      expect(onFinish).toHaveBeenCalledWith(expect.objectContaining({ onboarding_completed: true }));
+    });
   });
 
   it("shows a visible error when entering the app fails", async () => {

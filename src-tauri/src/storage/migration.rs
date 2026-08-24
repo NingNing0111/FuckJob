@@ -139,19 +139,30 @@ pub fn migrate_to_current<B: CredentialBackend + ?Sized>(
             .to_string_lossy()
             .into_owned();
     config.schema_version = CURRENT_SCHEMA_VERSION;
-    config::validate_and_normalize(&mut config).map_err(AppError::validation)?;
+    config::normalize_loaded_config(&mut config).map_err(AppError::validation)?;
 
-    if let Some(original) = original_config.as_deref() {
-        let backup_bytes = match raw_config.as_ref() {
-            Some(raw) if legacy_plaintext_key(raw).is_some() => sanitized_config_backup(raw)?,
-            _ => original.to_vec(),
-        };
-        report
-            .backups
-            .push(write_backup(paths, "app-config.yaml", &backup_bytes)?);
+    // 旧版自动保存可能已经写入半成品 LLM 配置。其他数据迁移仍然可以
+    // 安全完成，但普通草稿不应借 schema 升级被重新写回：保留原文件，等用户
+    // 补全后由严格保存路径一次性升级。唯一例外是旧文件仍含明文 API Key，
+    // 此时必须立即用已去密的强类型配置覆盖，不能为了保留草稿继续暴露密钥。
+    let config_can_be_persisted = config::validate_llm_config_for_persistence(&config).is_ok();
+    let contains_legacy_plaintext = raw_config
+        .as_ref()
+        .and_then(legacy_plaintext_key)
+        .is_some();
+    if config_can_be_persisted || contains_legacy_plaintext {
+        if let Some(original) = original_config.as_deref() {
+            let backup_bytes = match raw_config.as_ref() {
+                Some(raw) if legacy_plaintext_key(raw).is_some() => sanitized_config_backup(raw)?,
+                _ => original.to_vec(),
+            };
+            report
+                .backups
+                .push(write_backup(paths, "app-config.yaml", &backup_bytes)?);
+        }
+
+        write_migrated_config(&paths.config_path, &config)?;
     }
-
-    write_migrated_config(&paths.config_path, &config)?;
     Ok(report)
 }
 
@@ -806,6 +817,84 @@ browser_config:
         assert_eq!(error.code, AppErrorCode::Configuration);
         assert_eq!(fs::read(&paths.config_path).unwrap(), future.as_bytes());
         assert!(!paths.user_resumes_path().exists());
+    }
+
+    #[test]
+    fn incomplete_v2_llm_draft_does_not_abort_or_get_rewritten_during_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let original = br#"schema_version: 2
+llm_config:
+  provider: openai
+  base_url: https://llm.example.test/v1
+  model: ""
+browser_config:
+  user_data_dir: ""
+  chrome_exe_path: null
+"#;
+        write_config(&paths, original);
+        let resume = resume_document(&[("legacy", "content")]);
+        write_json(&paths.legacy_user_resumes_path(), &resume);
+
+        let report = migrate_to_current(&paths, &FakeCredentialBackend::default())
+            .expect("不完整 LLM 草稿不应让 setup 迁移失败");
+
+        assert!(report.migrated);
+        assert_eq!(report.resume_action, ResumeMigrationAction::OldCopied);
+        assert_eq!(fs::read(&paths.config_path).unwrap(), original);
+        assert!(report.backups.iter().all(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !name.contains("app-config"))
+        }));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(paths.user_resumes_path()).unwrap()).unwrap(),
+            resume
+        );
+        assert!(!paths.legacy_user_resumes_path().exists());
+
+        let loaded = crate::config::parse_config_content(
+            &fs::read_to_string(&paths.config_path).unwrap(),
+        )
+        .expect("保留的配置仍应作为草稿交给 UI");
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.llm_config.unwrap().model, "");
+    }
+
+    #[test]
+    fn incomplete_v2_draft_with_plaintext_key_is_sanitized_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        write_config(
+            &paths,
+            br#"schema_version: 2
+llm_config:
+  provider: openai
+  base_url: https://llm.example.test/v1
+  model: ""
+  api_key: plaintext-secret
+browser_config:
+  user_data_dir: ""
+  chrome_exe_path: null
+"#,
+        );
+        let backend = FakeCredentialBackend::default();
+
+        let report = migrate_to_current(&paths, &backend)
+            .expect("去除明文密钥时也不应被不完整模型草稿阻断");
+
+        assert_eq!(backend.value.borrow().as_deref(), Some("plaintext-secret"));
+        let migrated = fs::read_to_string(&paths.config_path).unwrap();
+        assert!(!migrated.contains("plaintext-secret"));
+        assert!(migrated.contains(&format!("schema_version: {CURRENT_SCHEMA_VERSION}")));
+        let loaded = crate::config::parse_config_content(&migrated)
+            .expect("去密后的不完整配置仍应作为草稿加载");
+        assert_eq!(loaded.llm_config.unwrap().model, "");
+        for backup in report.backups {
+            assert!(!fs::read_to_string(backup)
+                .unwrap()
+                .contains("plaintext-secret"));
+        }
     }
 
     #[test]
