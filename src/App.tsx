@@ -60,9 +60,9 @@ function MainShell({ config, update, save, status, message, dirty, importConfig,
     analysis_config: getAnalysisConfig(activeProfile),
   }), [activeProfile, config, profiles]);
 
-  // 填了一半的大模型服务也照常落盘：它只是草稿，后端不会拿它去发起调用。
-  // 曾经这里要拦下不完整的草稿，是因为后端拒绝保存——那反过来卡死了配置页，
-  // 模型名要拉列表才知道，拉列表又得先把这份配置连同密钥存好。
+  // 不完整的大模型服务会由 useAppConfig 标为校验错误，只留在内存中；用户补齐
+  // 后状态恢复为 idle，下面的防抖保存会自动继续。API Key 有独立的凭据保存流程，
+  // 获取模型列表不依赖把这份半成品配置落盘。
   useEffect(() => {
     if (!dirty || status === "loading" || status === "error") return;
     const timer = window.setTimeout(() => { void save(); }, 700);

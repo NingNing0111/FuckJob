@@ -44,6 +44,21 @@ describe("useAppConfig", () => {
     expect(result.current.message).toBe("配置损坏");
   });
 
+  it("loads a historical incomplete model config for repair instead of treating it as saved", async () => {
+    vi.mocked(api.loadAppConfig).mockResolvedValue({
+      ...config,
+      onboarding_completed: true,
+      llm_config: { provider: "openai", base_url: "https://api.openai.com/v1", model: "" },
+    });
+    const { result } = renderHook(() => useAppConfig());
+
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+    expect(result.current.dirty).toBe(false);
+    expect(result.current.status).toBe("error");
+    expect(result.current.message).toBe("配置异常：主用模型的模型名称不能为空；修正后自动保存");
+    expect(api.saveAppConfig).not.toHaveBeenCalled();
+  });
+
   it("updates nested config immutably", async () => {
     vi.mocked(api.loadAppConfig).mockResolvedValue(config);
     const { result } = renderHook(() => useAppConfig());
@@ -110,6 +125,73 @@ describe("useAppConfig", () => {
     await act(() => result.current.save());
     expect(result.current.status).toBe("error");
     expect(result.current.message).toBe("无法保存");
+  });
+
+  it("keeps an incomplete primary model as an in-memory draft and never calls the backend", async () => {
+    vi.mocked(api.loadAppConfig).mockResolvedValue(config);
+    const { result } = renderHook(() => useAppConfig());
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+
+    act(() => result.current.updateConfig((current) => ({
+      ...current,
+      llm_config: { provider: "openai", base_url: "https://api.openai.com/v1", model: "  " },
+    })));
+
+    expect(result.current.dirty).toBe(true);
+    expect(result.current.status).toBe("error");
+    expect(result.current.message).toBe("配置未保存：主用模型的模型名称不能为空");
+    await act(async () => {
+      expect(await result.current.save()).toBe(false);
+    });
+    expect(api.saveAppConfig).not.toHaveBeenCalled();
+  });
+
+  it("becomes saveable again after the invalid draft is corrected", async () => {
+    vi.mocked(api.loadAppConfig).mockResolvedValue(config);
+    vi.mocked(api.saveAppConfig).mockImplementation(async (submitted) => submitted);
+    const { result } = renderHook(() => useAppConfig());
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+
+    act(() => result.current.updateConfig((current) => ({
+      ...current,
+      llm_config: { provider: "openai", base_url: "https://api.openai.com/v1", model: "" },
+    })));
+    expect(result.current.status).toBe("error");
+
+    act(() => result.current.updateConfig((current) => ({
+      ...current,
+      llm_config: { ...current.llm_config!, model: "gpt-test" },
+    })));
+    expect(result.current.status).toBe("idle");
+    expect(result.current.message).toBe("");
+    await act(async () => {
+      expect(await result.current.save()).toBe(true);
+    });
+    expect(api.saveAppConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an incomplete retained fallback even when it is disabled", async () => {
+    vi.mocked(api.loadAppConfig).mockResolvedValue(config);
+    const { result } = renderHook(() => useAppConfig());
+    await waitFor(() => expect(result.current.config).not.toBeNull());
+
+    const next = {
+      ...config,
+      llm_fallbacks: [{
+        id: "backup-a",
+        label: null,
+        provider: "deepseek" as const,
+        base_url: "https://api.deepseek.com",
+        model: "",
+        enabled: false,
+      }],
+    };
+    await act(async () => {
+      expect(await result.current.save(next)).toBe(false);
+    });
+    expect(result.current.status).toBe("error");
+    expect(result.current.message).toBe("配置未保存：备用模型 1 的模型名称不能为空");
+    expect(api.saveAppConfig).not.toHaveBeenCalled();
   });
 
   /**

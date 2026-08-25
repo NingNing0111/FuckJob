@@ -209,7 +209,10 @@ pub fn load_app_config_inner(app_handle: tauri::AppHandle) -> Result<AppRuntimeC
     ensure_browser_user_data_dir(&app_handle, &mut config)?;
     ensure_browser_exe_path(&mut config);
 
-    if needs_save {
+    // 历史版本可能已把缺少模型名的草稿写入文件。此时即使浏览器路径
+    // 需要自动修复，也不能为了写回路径就把整份配置送进严格保存并阻断启动。
+    // 先保留内存中已修复的路径，等用户补全 LLM 配置后再一并落盘。
+    if needs_save && load_repairs_can_be_persisted(&config) {
         save_app_config_inner(app_handle, config.clone())?;
     }
 
@@ -325,7 +328,7 @@ pub(crate) fn parse_config_content(content: &str) -> Result<AppRuntimeConfig, St
         )];
     }
 
-    validate_and_normalize(&mut config)?;
+    normalize_loaded_config(&mut config)?;
     Ok(config)
 }
 
@@ -351,12 +354,8 @@ fn parse_llm_config(
         serde_yaml::from_value(value.clone()).map_err(|error| error.to_string())?;
     let base_url = raw.base_url.unwrap_or_default();
     let model = raw.model.unwrap_or_default();
-    if base_url.trim().is_empty() || model.trim().is_empty() {
-        return if allow_incomplete_legacy {
-            Ok(None)
-        } else {
-            Err("大模型地址和模型名称不能为空".to_string())
-        };
+    if allow_incomplete_legacy && (base_url.trim().is_empty() || model.trim().is_empty()) {
+        return Ok(None);
     }
 
     let provider = match raw.provider {
@@ -364,16 +363,13 @@ fn parse_llm_config(
         None if allow_incomplete_legacy => infer_legacy_provider(&base_url),
         None => return Err("大模型服务预设不能为空".to_string()),
     };
-    let mut config = AppRuntimeConfig {
-        llm_config: Some(LlmConfig {
-            provider,
-            base_url,
-            model,
-        }),
-        ..default_app_config()
+    let mut config = LlmConfig {
+        provider,
+        base_url,
+        model,
     };
-    validate_and_normalize(&mut config)?;
-    Ok(config.llm_config)
+    normalize_llm_config(&mut config);
+    Ok(Some(config))
 }
 
 /// Known legacy URLs map to their matching preset. Unknown legacy endpoints
@@ -401,7 +397,12 @@ fn infer_legacy_provider(base_url: &str) -> LlmProviderPreset {
     }
 }
 
-pub fn validate_and_normalize(config: &mut AppRuntimeConfig) -> Result<(), String> {
+/// 读取时的容错规整。
+///
+/// 已经被旧版自动保存写入的不完整 LLM 配置仍然是用户草稿，不能因此让整个
+/// 应用无法启动。除 LLM 地址/模型名的完整性外，版本、provider 反序列化、
+/// 备用服务标识和其他结构校验都仍在这里执行。
+pub(crate) fn normalize_loaded_config(config: &mut AppRuntimeConfig) -> Result<(), String> {
     if config.schema_version > CURRENT_SCHEMA_VERSION {
         return Err(format!(
             "应用配置版本 {} 高于当前支持的版本 {}",
@@ -427,16 +428,53 @@ pub fn validate_and_normalize(config: &mut AppRuntimeConfig) -> Result<(), Strin
         return Ok(());
     }
 
-    let Some(llm_config) = config.llm_config.as_mut() else {
-        return Ok(());
-    };
-
-    // 只做规整，不因为「还没填完」拒绝落盘：
-    // 配置页要靠已保存的密钥去拉模型列表，拒绝保存会让用户永远填不完这份配置。
-    // 未填完的服务由 `llm_active` / `llm_chain` 挡在调用之外。
-    llm_config.base_url = llm_config.base_url.trim().trim_end_matches('/').to_string();
-    llm_config.model = llm_config.model.trim().to_string();
+    if let Some(llm_config) = config.llm_config.as_mut() {
+        normalize_llm_config(llm_config);
+    }
     Ok(())
+}
+
+fn normalize_llm_config(config: &mut LlmConfig) {
+    config.base_url = config.base_url.trim().trim_end_matches('/').to_string();
+    config.model = config.model.trim().to_string();
+}
+
+/// 所有最终落盘路径的 LLM 完整性校验。
+///
+/// 读取可以保留历史草稿，但新的保存、导出和导入不得再把空地址或空模型名写回文件。
+pub(crate) fn validate_llm_config_for_persistence(
+    config: &AppRuntimeConfig,
+) -> Result<(), String> {
+    if let Some(primary) = config.llm_config.as_ref() {
+        if primary.base_url.trim().is_empty() {
+            return Err("主用大模型服务地址不能为空".to_string());
+        }
+        if primary.model.trim().is_empty() {
+            return Err("主用大模型名称不能为空".to_string());
+        }
+    }
+
+    for fallback in &config.llm_fallbacks {
+        if fallback.base_url.trim().is_empty() {
+            return Err(format!("备用大模型服务 {} 的地址不能为空", fallback.id));
+        }
+        if fallback.model.trim().is_empty() {
+            return Err(format!("备用大模型服务 {} 的模型名称不能为空", fallback.id));
+        }
+    }
+
+    Ok(())
+}
+
+fn load_repairs_can_be_persisted(config: &AppRuntimeConfig) -> bool {
+    validate_llm_config_for_persistence(config).is_ok()
+}
+
+/// 新配置落盘前的严格校验与规整。解析历史文件应调用
+/// [`normalize_loaded_config`]，不得用严格保存规则阻断应用启动。
+pub fn validate_and_normalize(config: &mut AppRuntimeConfig) -> Result<(), String> {
+    normalize_loaded_config(config)?;
+    validate_llm_config_for_persistence(config)
 }
 
 /// v1 在模板缺少 LLM 条目时会在运行期把生成内容隐式插到第一条。
@@ -513,12 +551,11 @@ fn normalize_llm_fallbacks(fallbacks: &mut Vec<LlmProviderEntry>) -> Result<(), 
             .map(str::to_string);
     }
 
-    // 界面上新增一行后还没来得及填写就保存，属于常见操作，静默丢弃即可
+    // 历史配置里可能残留完全空白的占位行；它不包含任何可恢复信息，静默丢弃即可。
     fallbacks.retain(|entry| !(entry.base_url.is_empty() && entry.model.is_empty()));
 
-    // 只校验标识——它决定密钥存放在哪个 keyring 条目，错了会读写到别人的密钥。
-    // 地址和模型名填了一半不算错误：那只是还没编辑完的草稿，
-    // 由 `LlmProviderEntry::is_usable` 决定它进不进降级链。
+    // 标识决定密钥存放在哪个 keyring 条目，读取历史草稿时也必须严格校验。
+    // 地址和模型名的完整性由持久化路径另行校验；宽容读取时则保留草稿供 UI 修复。
     let mut seen_ids: HashSet<&str> = HashSet::new();
     for entry in fallbacks.iter() {
         if !is_valid_entry_id(&entry.id) {
@@ -543,8 +580,7 @@ pub fn import_app_config_inner(
 ) -> Result<AppRuntimeConfig, AppError> {
     let mut config = read_config_file(Path::new(path))?;
     ensure_browser_user_data_dir(&app_handle, &mut config)?;
-    save_app_config_inner(app_handle, config.clone())?;
-    Ok(config)
+    save_app_config_inner(app_handle, config)
 }
 
 pub fn export_app_config_inner(path: &str, mut config: AppRuntimeConfig) -> Result<(), AppError> {
@@ -720,7 +756,9 @@ pub fn resolve_job_profile(
     profile_id: Option<&str>,
 ) -> Result<ResolvedJobProfile, String> {
     let mut snapshot = config.clone();
-    validate_and_normalize(&mut snapshot)?;
+    // 快照解析不是持久化路径；历史 LLM 草稿由 llm_chain 排除，不应阻断不依赖
+    // LLM 的任务。
+    normalize_loaded_config(&mut snapshot)?;
     let profile = snapshot.job_profile(profile_id)?.clone();
     if profile.archived {
         return Err(format!(
@@ -804,9 +842,8 @@ pub struct LlmConfig {
 
 /// 一个大模型服务是否填写完整、可以真正发起调用。
 ///
-/// 配置页允许存在填了一半的服务：模型名要从服务端拉列表才知道，而拉列表得先存密钥，
-/// 密钥又跟着这份配置一起落盘——若要求「填完才准保存」，这三者就会互相等待。
-/// 因此校验放宽为「可以存」，能不能用改由这里判断，未填完的服务不会进入降级链。
+/// 历史坏配置或页面内存草稿可能暂时缺少地址或模型名。它们既不能落盘，也不能进入
+/// 调用链；页面补全后才会恢复自动保存。获取模型列表和保存凭据均不依赖草稿落盘。
 fn service_is_usable(base_url: &str, model: &str) -> bool {
     !base_url.trim().is_empty() && !model.trim().is_empty()
 }
@@ -981,7 +1018,7 @@ impl AppRuntimeConfig {
         chain.extend(
             self.llm_fallbacks
                 .iter()
-                // 填了一半的备用服务只是草稿，允许保存但不参与调用
+                // 宽容读取出的历史草稿不参与调用；新的持久化路径会拒绝此类条目。
                 .filter(|entry| entry.enabled && entry.is_usable())
                 .map(|entry| LlmChainLink {
                     id: entry.id.clone(),
@@ -2038,12 +2075,9 @@ mod tests {
         assert_eq!(llm.model, "qwen3");
     }
 
-    /// 没填完的主用服务能存下来，但不会被拿去调用。
-    ///
-    /// 反过来做——拒绝保存——会把配置页锁死：模型名要拉列表才知道，
-    /// 拉列表得先存好密钥，密钥又跟这份配置一起落盘。
+    /// 旧版已写入的不完整主用服务必须能读出来修复，但不允许再次落盘。
     #[test]
-    fn incomplete_primary_llm_config_is_saved_but_stays_inactive() {
+    fn incomplete_current_llm_config_loads_as_a_draft_but_cannot_be_persisted() {
         for (base_url, model) in [
             ("", "qwen3"),
             ("   ", "qwen3"),
@@ -2057,12 +2091,50 @@ mod tests {
                 model: model.to_string(),
             });
 
-            validate_and_normalize(&mut config).unwrap();
+            let yaml = serde_yaml::to_string(&config).unwrap();
+            let mut loaded = parse_config_content(&yaml).expect("历史草稿不应阻断启动");
 
-            assert!(config.llm_config.is_some());
-            assert!(!config.llm_active());
-            assert!(config.llm_chain().is_empty());
+            assert!(loaded.llm_config.is_some());
+            assert!(!loaded.llm_active());
+            assert!(loaded.llm_chain().is_empty());
+            let error = validate_and_normalize(&mut loaded).unwrap_err();
+            assert!(error.contains("不能为空"));
         }
+    }
+
+    #[test]
+    fn invalid_provider_is_still_rejected_while_loading_a_draft() {
+        let error = parse_config_content(
+            r#"
+schema_version: 3
+llm_config:
+  provider: definitely_not_a_provider
+  base_url: https://llm.example.test/v1
+  model: ""
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("unknown variant"));
+    }
+
+    #[test]
+    fn incomplete_llm_draft_does_not_trigger_strict_load_repair_writeback() {
+        let config = parse_config_content(
+            r#"
+schema_version: 3
+llm_config:
+  provider: openai
+  base_url: https://llm.example.test/v1
+  model: ""
+browser_config:
+  user_data_dir: ""
+  chrome_exe_path: null
+"#,
+        )
+        .expect("历史草稿必须能加载");
+
+        assert!(!load_repairs_can_be_persisted(&config));
     }
 
     /// 老用户的配置文件里没有轮询这几块字段。它们全靠 serde 默认值补齐，
@@ -3053,10 +3125,10 @@ job_profiles: []
         assert_eq!(config.browser_config.max_parallel_tasks, MIN_PARALLEL_TASKS);
     }
 
-    /// 全空的行是「加了一行还没填」，直接丢弃；填了一半的是编辑到一半的草稿，
-    /// 要留住，但不能进降级链——否则运行时会拿着空模型名去发请求。
+    /// 读取时，全空的行视为未填写的占位并丢弃；填了一半的历史草稿要留住，
+    /// 但不能进降级链，也不能再次落盘。
     #[test]
-    fn blank_fallback_rows_are_dropped_and_half_filled_rows_are_kept_out_of_the_chain() {
+    fn fallback_drafts_load_safely_but_half_filled_rows_cannot_be_persisted() {
         let mut config = default_app_config();
         config.llm_config = Some(LlmConfig {
             provider: LlmProviderPreset::OpenAi,
@@ -3071,7 +3143,7 @@ job_profiles: []
             fallback_entry("backup-a", "qwen-max"),
         ];
 
-        validate_and_normalize(&mut config).unwrap();
+        normalize_loaded_config(&mut config).unwrap();
 
         let ids: Vec<&str> = config
             .llm_fallbacks
@@ -3082,6 +3154,10 @@ job_profiles: []
 
         let chain_ids: Vec<String> = config.llm_chain().into_iter().map(|link| link.id).collect();
         assert_eq!(chain_ids, vec![PRIMARY_LLM_ENTRY_ID, "backup-a"]);
+
+        let error = validate_and_normalize(&mut config).unwrap_err();
+        assert!(error.contains("backup-half"));
+        assert!(error.contains("模型名称不能为空"));
     }
 
     #[test]

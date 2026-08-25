@@ -466,8 +466,8 @@ export function getAnalysisConfig(
 /**
  * 一个大模型服务是否填写完整、可以真正发起调用。
  *
- * 配置页允许保存填了一半的服务（模型名要拉列表才知道，拉列表又得先存好密钥），
- * 所以「存下来了」不等于「能用」。与 Rust 侧的 `service_is_usable` 保持一致。
+ * 配置页会在服务未填完时保留内存草稿，但不会把不完整内容写入配置文件。
+ * 这个判断也用于决定服务能否真正发起调用。
  */
 export function isLlmServiceUsable(
   service: Pick<LlmConfig, "base_url" | "model"> | null | undefined,
@@ -475,9 +475,32 @@ export function isLlmServiceUsable(
   return Boolean(service?.base_url.trim() && service.model.trim());
 }
 
-/** 是否已经保存过主用大模型配置。填了一半也算，界面据此显示「继续配置」而不是「去配置」。 */
+/** 是否已经创建主用大模型配置；未填完的内存草稿也算。 */
 export function isLlmConfigured(config: Pick<AppRuntimeConfig, "llm_config">): boolean {
   return config.llm_config !== null;
+}
+
+/**
+ * 返回配置落盘前的第一个可读校验错误；`null` 表示可以保存。
+ *
+ * 没有配置主用模型是合法状态。只要保留了一条主用或备用服务，它的地址和
+ * 模型名称就必须同时填写完整，避免自动保存把编辑到一半的草稿写进配置文件。
+ */
+export function getAppConfigSaveValidationError(
+  config: Pick<AppRuntimeConfig, "llm_config" | "llm_fallbacks">,
+): string | null {
+  if (config.llm_config) {
+    if (!config.llm_config.base_url.trim()) return "主用模型的服务地址不能为空";
+    if (!config.llm_config.model.trim()) return "主用模型的模型名称不能为空";
+  }
+
+  for (const [index, fallback] of config.llm_fallbacks.entries()) {
+    const name = `备用模型 ${index + 1}`;
+    if (!fallback.base_url.trim()) return `${name} 的服务地址不能为空`;
+    if (!fallback.model.trim()) return `${name} 的模型名称不能为空`;
+  }
+
+  return null;
 }
 
 /**

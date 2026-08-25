@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { exportAppConfig, importAppConfig, loadAppConfig, saveAppConfig } from "@/lib/tauriConfig";
-import type { AppRuntimeConfig, StatusKind } from "@/types/app-config";
+import { getAppConfigSaveValidationError, type AppRuntimeConfig, type StatusKind } from "@/types/app-config";
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : "操作失败";
 
@@ -10,6 +10,12 @@ export function useAppConfig() {
   const [message, setMessage] = useState("");
   const savedSnapshot = useRef("");
   const dirty = Boolean(config) && JSON.stringify(config) !== savedSnapshot.current;
+  const configValidationError = config ? getAppConfigSaveValidationError(config) : null;
+  const validationMessage = configValidationError
+    ? dirty
+      ? `配置未保存：${configValidationError}`
+      : `配置异常：${configValidationError}；修正后自动保存`
+    : "";
 
   const load = useCallback(async () => {
     setStatus("loading");
@@ -36,6 +42,12 @@ export function useAppConfig() {
   const save = useCallback(async (nextConfig?: AppRuntimeConfig) => {
     const value = nextConfig ?? config;
     if (!value) return false;
+    const validationError = getAppConfigSaveValidationError(value);
+    if (validationError) {
+      setStatus("error");
+      setMessage(`配置未保存：${validationError}`);
+      return false;
+    }
     const configAtSaveStart = config;
     setStatus("loading");
     try {
@@ -80,5 +92,15 @@ export function useAppConfig() {
     }
   }, [config]);
 
-  return { config, status, message, dirty, load, save, importConfig, exportConfig, updateConfig };
+  return {
+    config,
+    status: configValidationError ? "error" as const : status,
+    message: validationMessage || message,
+    dirty,
+    load,
+    save,
+    importConfig,
+    exportConfig,
+    updateConfig,
+  };
 }

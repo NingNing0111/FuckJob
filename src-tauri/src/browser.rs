@@ -17,7 +17,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
-use rust_drission::{stealth_inject, ChromiumPage, Page};
+use rust_drission::{cdp::CdpClient, stealth_inject, ChromiumPage, Page};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
@@ -420,6 +420,38 @@ fn is_cdp_version_response(response: &[u8]) -> bool {
     body.contains("\"webSocketDebuggerUrl\"") && body.contains("ws://")
 }
 
+/// Extract the browser-level WebSocket URL used for commands such as
+/// `Target.createTarget`. Unlike the feature probe above, callers need the
+/// exact URL, so a loosely matched or chunked payload is not sufficient here.
+fn parse_cdp_websocket_url(response: &[u8]) -> Option<String> {
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let (head, body) = response.split_at(separator);
+    let head = std::str::from_utf8(head).ok()?;
+    let status_ok = head.lines().next().is_some_and(|status_line| {
+        status_line.starts_with("HTTP/1.") && status_line.contains(" 200")
+    });
+    if !status_ok {
+        return None;
+    }
+
+    serde_json::from_slice::<serde_json::Value>(&body[4..])
+        .ok()?
+        .get("webSocketDebuggerUrl")?
+        .as_str()
+        .filter(|url| url.starts_with("ws://") || url.starts_with("wss://"))
+        .map(str::to_string)
+}
+
+fn connect_browser_cdp(port: u16) -> Result<CdpClient> {
+    let response =
+        fetch_cdp_version_response(port).ok_or_else(|| anyhow!("无法读取浏览器调试端口 {port}"))?;
+    let websocket_url = parse_cdp_websocket_url(&response)
+        .ok_or_else(|| anyhow!("浏览器调试端口 {port} 未返回可用的 WebSocket 地址"))?;
+    Ok(CdpClient::connect(&websocket_url)?)
+}
+
 fn probe_debug_port(port: u16) -> DebugPortProbe {
     match fetch_cdp_version_response(port) {
         None => DebugPortProbe::Free,
@@ -524,24 +556,32 @@ fn connect_task_browser(port: u16) -> Result<ChromiumPage> {
     }
 }
 
+fn managed_browser_args(config: &BrowserConfig, port: u16) -> Vec<String> {
+    vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", config.user_data_dir),
+        "--window-size=1920,1080".to_string(),
+        "--start-minimized".to_string(),
+        "--disable-background-timer-throttling".to_string(),
+        "--disable-backgrounding-occluded-windows".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-suggestions-ui".to_string(),
+        "--no-first-run".to_string(),
+        "--disable-infobars".to_string(),
+        "--disable-popup-blocking".to_string(),
+        "--hide-crash-restore-bubble".to_string(),
+        "--disable-features=PrivacySandboxSettings4".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
+        "--no-sandbox".to_string(),
+    ]
+}
+
 fn launch_managed_browser(config: &BrowserConfig, port: u16) -> Result<ChromiumPage> {
     fs::create_dir_all(&config.user_data_dir)?;
     let executable = browser_executable(config)?;
     let mut child = Command::new(executable)
-        .args([
-            format!("--remote-debugging-port={port}"),
-            format!("--user-data-dir={}", config.user_data_dir),
-            "--window-size=1920,1080".to_string(),
-            "--no-default-browser-check".to_string(),
-            "--disable-suggestions-ui".to_string(),
-            "--no-first-run".to_string(),
-            "--disable-infobars".to_string(),
-            "--disable-popup-blocking".to_string(),
-            "--hide-crash-restore-bubble".to_string(),
-            "--disable-features=PrivacySandboxSettings4".to_string(),
-            "--disable-blink-features=AutomationControlled".to_string(),
-            "--no-sandbox".to_string(),
-        ])
+        .args(managed_browser_args(config, port))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -852,13 +892,59 @@ pub fn close_browser_session() -> Result<()> {
     Ok(())
 }
 
-/// 创建一个尚未导航的标签，并在首个文档加载前注册反检测脚本。
+fn create_background_target(client: &CdpClient) -> Result<String> {
+    client
+        .send("Target.createTarget", Some(background_target_params()))?
+        .get("targetId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("后台标签页创建成功，但 CDP 未返回 targetId"))
+}
+
+fn background_target_params() -> serde_json::Value {
+    serde_json::json!({
+        "url": "about:blank",
+        "background": true
+    })
+}
+
+fn close_target(client: &CdpClient, target_id: &str) {
+    let _ = client.send(
+        "Target.closeTarget",
+        Some(serde_json::json!({ "targetId": target_id })),
+    );
+}
+
+/// 创建一个不会被激活的业务标签，并在首个文档加载前注册反检测脚本。
 ///
-/// 不使用 `ChromiumPage::new_tab()` 的隐式行为，避免调用方在“网页点击后才
-/// 创建的标签”上错过首个页面加载时机。
+/// `rust_drission::new_tab()` 没有传入 CDP 的 `background` 参数，Chrome 会
+/// 选中每个新岗位标签，自动招呼时便反复把浏览器抢到前台。这里先通过
+/// browser-level CDP 创建后台 target，再附加到这个精确的 target。
 pub fn new_stealth_tab(browser: &ChromiumPage) -> Result<Page> {
-    let tab = browser.new_tab_without_stealth(None)?;
-    stealth_inject(&tab)?;
+    let port = ACTIVE_DEBUG_PORT
+        .read()
+        .map_err(|e| anyhow!("获取浏览器调试端口读锁失败: {}", e))?
+        .ok_or_else(|| anyhow!("浏览器调试端口未知，无法创建后台标签页"))?;
+    let client = connect_browser_cdp(port)?;
+    let target_id = create_background_target(&client)?;
+    let tab = match browser
+        .browser()
+        .get_tab(&target_id, None, None, Some("page"))
+    {
+        Ok(Some(tab)) => tab,
+        Ok(None) => {
+            close_target(&client, &target_id);
+            return Err(anyhow!("无法附加到刚创建的后台标签页 {target_id}"));
+        }
+        Err(error) => {
+            close_target(&client, &target_id);
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = stealth_inject(&tab) {
+        close_target(&client, &target_id);
+        return Err(error.into());
+    }
     Ok(tab)
 }
 
@@ -1016,6 +1102,45 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: 123\r\n\r\n{\"Browser\":\"Chrome/131.0.6778.86\",\"Protocol-Version\":\"1.3\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:9876/devtools/browser/abcd\"}";
 
         assert!(is_cdp_version_response(response));
+        assert_eq!(
+            parse_cdp_websocket_url(response).as_deref(),
+            Some("ws://127.0.0.1:9876/devtools/browser/abcd")
+        );
+    }
+
+    #[test]
+    fn business_tabs_are_requested_without_foreground_activation() {
+        let params = background_target_params();
+
+        assert_eq!(
+            params.get("url").and_then(serde_json::Value::as_str),
+            Some("about:blank")
+        );
+        assert_eq!(
+            params
+                .get("background")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn managed_browser_starts_minimized_without_throttling_background_work() {
+        let config = BrowserConfig {
+            user_data_dir: "test-profile".to_string(),
+            chrome_exe_path: None,
+            max_parallel_tasks: 2,
+        };
+        let args = managed_browser_args(&config, DEFAULT_RPA_DEBUG_PORT);
+
+        for required in [
+            "--start-minimized",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+        ] {
+            assert!(args.iter().any(|arg| arg == required), "missing {required}");
+        }
     }
 
     #[test]

@@ -47,6 +47,11 @@ const RELOAD_VIA: &str = "全部";
 /// 代价只是真的没有未读时多等 3 秒，比误报「没有未读」便宜得多。
 const EMPTY_MUST_HOLD: Duration = Duration::from_secs(3);
 
+/// 分类标签已经挂载时，当前 owned tab 可以直接复用，无需再次冷导航。
+pub(crate) fn is_chat_page_ready(page: &Page) -> Result<bool, anyhow::Error> {
+    Ok(page.ele(LABEL_ITEM)?.is_some())
+}
+
 /// 等沟通页就绪。分类标签是页面骨架里最先稳定下来的部分，两个任务打开页面后
 /// 的第一步都是等它——20 秒不是保守：一次冷加载实测就要 8 秒上下。
 pub(crate) fn wait_for_chat_page(page: &Page, timeout: Duration) -> Result<(), anyhow::Error> {

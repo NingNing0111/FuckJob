@@ -859,16 +859,20 @@ fn map_rig_error(
         .provider_response_json()
         .ok()
         .flatten()
-        .and_then(|value| value.get("error").cloned())
         .and_then(|value| provider_error_metadata(&value));
 
     // Build a safe user-facing diagnostic (HTTP status + provider error code/type).
     // The `provider_error_metadata` output only includes alphanumeric-safe fields
     // (code, type), never raw message bodies, so it is safe to surface to users.
+    //
+    // 没有状态码时也要带上诊断：Responses 协议的错误多数是 HTTP 200 流里的
+    // `error` / `response.failed` 事件，状态码恒为空，丢掉 code 就只剩一句
+    // 「大模型流式生成失败」，日志完全指不出方向。
     let diagnostic = match (status_code, metadata.as_ref()) {
         (Some(s), Some(m)) => Some(format!("（HTTP {s}，{m}）")),
         (Some(s), None) => Some(format!("（HTTP {s}）")),
-        (None, _) => None,
+        (None, Some(m)) => Some(format!("（{m}）")),
+        (None, None) => None,
     };
 
     let base = match status_code {
@@ -887,6 +891,16 @@ fn map_rig_error(
                     "大模型流式请求失败"
                 } else {
                     "无法连接大模型服务"
+                }
+            }
+            // 上游用 HTTP 200 加错误信封作答（Responses 的 SSE `error`、
+            // `response.failed`、`response.incomplete` 事件都走这里）。这与本地解析失败
+            // 是两回事，混成同一句会让人误以为是客户端的锅。
+            CompletionError::ProviderResponse(_) => {
+                if streaming {
+                    "大模型服务在流式响应中返回错误"
+                } else {
+                    "大模型服务返回错误响应"
                 }
             }
             _ => {
@@ -918,7 +932,8 @@ fn map_rig_error(
     let detail = match (status_code, metadata) {
         (Some(s), Some(m)) => Some(format!("HTTP {s}; {m}")),
         (Some(s), None) => Some(format!("HTTP {s}")),
-        (None, _) => safe_completion_detail(&error),
+        (None, Some(m)) => Some(m),
+        (None, None) => safe_completion_detail(&error),
     };
     if let Some(detail) = detail {
         mapped = mapped.with_detail(detail);
@@ -946,7 +961,7 @@ fn safe_completion_detail(error: &CompletionError) -> Option<String> {
         CompletionError::UrlError(_) => Some("invalid provider URL".to_string()),
         CompletionError::ResponseError(_) => Some("provider response parse failed".to_string()),
         CompletionError::ProviderResponse(_) => {
-            Some("provider returned an error response".to_string())
+            Some("provider returned an error envelope with a success status".to_string())
         }
         CompletionError::ProviderError(_) => Some("provider request failed".to_string()),
         CompletionError::RequestError(_) => Some("completion request build failed".to_string()),
@@ -963,18 +978,56 @@ fn safe_provider_identifier(value: &str) -> Option<&str> {
     .then_some(value)
 }
 
-fn provider_error_metadata(error: &Value) -> Option<String> {
-    let mut fields = Vec::new();
-    for name in ["code", "type"] {
-        if let Some(value) = error
-            .get(name)
-            .and_then(Value::as_str)
-            .and_then(safe_provider_identifier)
-        {
-            fields.push(format!("{name}={value}"));
+/// 从 provider 的返回体里定位错误对象。三种形状都要认，否则 Responses 协议的失败
+/// 全都只剩一句没有信息量的中文：
+/// - HTTP 错误体：`{"error": {...}}`
+/// - Responses SSE 的 error 事件：错误字段直接摊在顶层，没有 `error` 包装
+/// - Responses 的 `response.failed`：`{"response": {"error": {...}}}`
+///
+/// 第二种的 `type` 恒为 `"error"`，展示出来没有意义，所以用 `bool` 标出来让调用方跳过。
+fn provider_error_object(body: &Value) -> Option<(&Value, bool)> {
+    if let Some(error) = body.get("error").filter(|value| value.is_object()) {
+        return Some((error, false));
+    }
+    if let Some(error) = body
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .filter(|value| value.is_object())
+    {
+        return Some((error, false));
+    }
+    (body.get("type").and_then(Value::as_str) == Some("error")).then_some((body, true))
+}
+
+fn provider_error_metadata(body: &Value) -> Option<String> {
+    if let Some((error, is_bare_error_event)) = provider_error_object(body) {
+        let names: &[&str] = if is_bare_error_event {
+            &["code"]
+        } else {
+            &["code", "type"]
+        };
+        let mut fields = Vec::new();
+        for name in names {
+            if let Some(value) = error
+                .get(name)
+                .and_then(Value::as_str)
+                .and_then(safe_provider_identifier)
+            {
+                fields.push(format!("{name}={value}"));
+            }
+        }
+        if !fields.is_empty() {
+            return Some(fields.join(", "));
         }
     }
-    (!fields.is_empty()).then(|| fields.join(", "))
+
+    // `response.incomplete` 不带 error 对象，截断原因只在 incomplete_details 里
+    body.get("response")
+        .and_then(|response| response.get("incomplete_details"))
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        .and_then(safe_provider_identifier)
+        .map(|reason| format!("incomplete_reason={reason}"))
 }
 
 #[cfg(test)]
@@ -1204,6 +1257,83 @@ mod tests {
         assert!(detail.contains("HTTP 429"));
         assert!(detail.contains("code=rate_limit"));
         assert!(!detail.contains(secret));
+    }
+
+    /// Responses 协议的失败绝大多数是 HTTP 200 流里的 `error` 事件：状态码恒为空，
+    /// 早先的映射在没有状态码时丢掉全部诊断，日志里只剩「大模型流式生成失败」，
+    /// 无从判断是本地解析问题还是上游拒绝。
+    #[test]
+    fn responses_stream_error_event_surfaces_the_provider_code() {
+        let secret = "prompt-and-token-never-retain";
+        let event = format!(
+            "data: {{\"type\":\"error\",\"code\":\"server_is_overloaded\",\"message\":\"{secret}\",\"sequence_number\":1}}\n\n"
+        );
+        let (url, _) = mock_server(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            Box::leak(event.into_bytes().into_boxed_slice()),
+        ]);
+
+        let error = tauri::async_runtime::block_on(
+            service_with_provider(LlmProviderPreset::OpenAiResponses, url)
+                .stream("stream test".to_string(), |_| Ok(())),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::Provider);
+        assert!(
+            error.message.contains("大模型服务在流式响应中返回错误"),
+            "应指明是上游返回的错误而非本地生成失败：{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("code=server_is_overloaded"),
+            "应带上上游错误码：{}",
+            error.message
+        );
+        assert!(
+            !error.message.contains(secret),
+            "不得回显上游响应体：{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn provider_error_metadata_reads_all_three_error_shapes() {
+        // HTTP 错误体
+        assert_eq!(
+            super::provider_error_metadata(&serde_json::json!({
+                "error": {"code": "rate_limit", "type": "requests"}
+            })),
+            Some("code=rate_limit, type=requests".to_string())
+        );
+        // Responses SSE 的 error 事件：字段摊在顶层，type 恒为 "error" 故跳过
+        assert_eq!(
+            super::provider_error_metadata(&serde_json::json!({
+                "type": "error", "code": "server_error", "message": "boom"
+            })),
+            Some("code=server_error".to_string())
+        );
+        // response.failed
+        assert_eq!(
+            super::provider_error_metadata(&serde_json::json!({
+                "type": "response.failed",
+                "response": {"error": {"code": "model_error", "type": "server_error"}}
+            })),
+            Some("code=model_error, type=server_error".to_string())
+        );
+        // response.incomplete 不带 error 对象，原因在 incomplete_details 里
+        assert_eq!(
+            super::provider_error_metadata(&serde_json::json!({
+                "type": "response.incomplete",
+                "response": {"incomplete_details": {"reason": "max_output_tokens"}}
+            })),
+            Some("incomplete_reason=max_output_tokens".to_string())
+        );
+        // 没有任何可安全展示的字段时不硬凑
+        assert_eq!(
+            super::provider_error_metadata(&serde_json::json!({"error": {"message": "boom"}})),
+            None
+        );
     }
 
     #[test]
